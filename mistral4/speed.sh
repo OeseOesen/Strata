@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# speed.sh - decode speed on realistic requests through the API, with and without n-gram speculation.
+# speed.sh - decode speed on realistic requests through the API, with and without speculation (n-gram, EAGLE).
 #   ./speed.sh [--port 8092] [--engine-args "..."]
 set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -24,7 +24,7 @@ for i in $(seq 1 180); do
   sleep 2
 done
 "$HERE/venv/bin/python" - "$PORT" <<'PY'
-import json, sys, time, urllib.request
+import hashlib, json, sys, time, urllib.request
 port = sys.argv[1]
 code = "\n".join(f"def step_{i}(values, factor):\n    total = 0\n    for v in values:\n        total += v * factor + {i}\n    return total\n" for i in range(12))
 tasks = [
@@ -40,13 +40,18 @@ def ask(prompt, effort, spec):
     t0 = time.time()
     r = json.load(urllib.request.urlopen(req, timeout=900))
     t = r.get("timings", {})
-    return t, time.time() - t0
-print(f"{'task':10} {'spec':>4} {'tokens':>6} {'decode tok/s':>12} {'drafted':>7} {'accepted':>8} {'windows':>7}")
+    msg = r.get("choices", [{}])[0].get("message", {})
+    return t, time.time() - t0, hashlib.md5(json.dumps(msg, sort_keys=True).encode()).hexdigest()[:8]
+print(f"{'task':10} {'spec':>4} {'tokens':>6} {'decode tok/s':>12} {'drafted':>7} {'accepted':>8} {'windows':>7} "
+      f"{'eagle d/a/w':>14} {'answer':>8}")
 for name, effort, prompt in tasks:
     for spec in (6, 0):   # drafted run first: the n-gram table learns each answer at its end
-        t, wall = ask(prompt, effort, spec)
+        t, wall, h = ask(prompt, effort, spec)
         n, ms = t.get("n_gen", 0), t.get("gen_ms", 1)
-        print(f"{name:10} {spec:>4} {n:>6} {n / (ms / 1000):>12.2f} {t.get('drafted', 0):>7} {t.get('accepted', 0):>8} {t.get('windows', 0):>7}", flush=True)
+        ew = f"{t.get('eagle_drafted', 0)}/{t.get('eagle_accepted', 0)}/{t.get('eagle_windows', 0)}"
+        print(f"{name:10} {spec:>4} {n:>6} {n / (ms / 1000):>12.2f} {t.get('drafted', 0):>7} {t.get('accepted', 0):>8} "
+              f"{t.get('windows', 0):>7} {ew:>14} {h:>8}", flush=True)
+print("(answer: a hash of the reply; greedy decoding must give the same hash with and without drafts)")
 PY
 kill -INT $PID 2>/dev/null; sleep 5; kill $PID 2>/dev/null
 echo "server log: $LOG"

@@ -54,7 +54,11 @@
 #include <vector>
 
 #ifdef __linux__
+#include <fcntl.h>
 #include <sched.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
 #endif
 
 using json = nlohmann::json;
@@ -112,6 +116,9 @@ struct Options {
     int ctx = 65536, chunk = 512, spec = 6, kv = m4k::KV_I8, workers = -1, host_core = -1, bench_pp = 512,
         bench_tg = 128, ngram_mib = 1024, seed = 0, gpu = 0;
     double vram_reserve = 1.5, vram_experts = -1, ram_gpu_node = -1, ram_other_node = -1;
+    std::string eagle;            // EAGLE draft head: Mistral's consolidated.safetensors (or its folder)
+    int eagle_k = 3;              // drafts per window at most (Mistral recommends 3)
+    double eagle_p = 0.3;         // stop drafting when the chain's probability (product of the steps') falls below
     std::string numa = "split";   // measured on the R740 (2x Gold 6154): split 42.6 tok/s decode vs tiered 35.3
     bool graph = true, keep_file_tier = true, attn_gemm = false;
 };
@@ -137,6 +144,11 @@ void usage() {
                  "  --workers N              CPU workers per node (default: every physical core)\n"
                  "  --host-core N            the CPU the GPU-feeding host thread sits on (default: first core of the GPU node)\n"
                  "  --heat FILE              expert routing counts (default <model>.m4heat; written at exit)\n"
+                 "  --eagle PATH             EAGLE draft head (Mistral-Small-4-119B-2603-eagle: consolidated.safetensors\n"
+                 "                           or its folder); drafts when the n-gram lookup has none\n"
+                 "  --eagle-k N              EAGLE drafts per window at most (default 3)\n"
+                 "  --eagle-p P              stop the EAGLE chain below this probability (product, default 0.3)\n"
+                 "  --eagle-acc IDS.txt      debug: teacher-forced top-1 accuracy of the model and of the EAGLE head\n"
                  "  --ngram-mib N            global n-gram table on the other node (default 1024, 0 = off)\n"
                  "  --no-graph               launch decode windows eagerly (debugging)\n"
                  "  --attn kernel|gemm       decode attention: the split-K kernel (default) or the prompt path's cuBLAS route\n"
@@ -154,6 +166,10 @@ Options parse(int argc, char** argv) {
             return argv[++i];
         };
         if (a == "-m" || a == "--model") o.model = next();
+        else if (a == "--eagle") o.eagle = next();
+        else if (a == "--eagle-k") o.eagle_k = std::stoi(next());
+        else if (a == "--eagle-p") o.eagle_p = std::stod(next());
+        else if (a == "--eagle-acc") { o.mode = "eagle-acc"; o.ids_file = next(); }
         else if (a == "--serve") o.mode = "serve";
         else if (a == "--bench") o.mode = "bench";
         else if (a == "--ppl") { o.mode = "ppl"; o.ids_file = next(); }
@@ -185,6 +201,8 @@ Options parse(int argc, char** argv) {
     if (o.model.empty() && o.mode != "selftest-attn") { usage(); fail("no model (-m)"); }
     if (o.attn_gemm) o.graph = false;   // the cuBLAS route's sizes follow the context: not capturable
     o.spec = std::max(0, std::min(o.spec, kMaxWin - 1));
+    o.eagle_k = std::max(1, std::min(o.eagle_k, kMaxWin - 1));
+    if (o.mode == "eagle-acc" && o.eagle.empty()) fail("--eagle-acc needs --eagle");
     o.chunk = std::max(kMaxWin + 1, o.chunk);
     if (o.heat.empty()) o.heat = o.model + ".m4heat";
     return o;
@@ -273,6 +291,125 @@ float* upload(const std::vector<float>& h) {
     return d;
 }
 
+// ================================================================================================ safetensors (EAGLE head)
+// Mistral ships the EAGLE head as consolidated.safetensors: every linear weight float8 e4m3 with a per-tensor
+// bf16 scale (qscale_weight; the activation scale qscale_act is not needed: activations stay q8_1 here), norms bf16.
+struct StTensor {
+    std::string dtype;
+    std::vector<int64_t> shape;
+    const uint8_t* data = nullptr;
+    size_t bytes = 0;
+};
+
+struct Safetensors {
+    void* map = nullptr;
+    size_t size = 0;
+    std::map<std::string, StTensor> t;
+    ~Safetensors() {
+        if (map) munmap(map, size);
+    }
+    void open(const std::string& path) {
+        const int fd = ::open(path.c_str(), O_RDONLY);
+        if (fd < 0) fail("cannot open " + path);
+        struct stat stt;
+        if (fstat(fd, &stt) != 0) fail("cannot stat " + path);
+        size = (size_t) stt.st_size;
+        void* m = mmap(nullptr, size, PROT_READ, MAP_PRIVATE, fd, 0);
+        ::close(fd);
+        if (m == MAP_FAILED) fail("cannot map " + path);
+        map = m;
+        const uint8_t* b = (const uint8_t*) map;
+        uint64_t hl = 0;
+        if (size < 8) fail(path + ": not a safetensors file");
+        std::memcpy(&hl, b, 8);
+        if (8 + hl > size) fail(path + ": not a safetensors file");
+        const json h = json::parse(std::string((const char*) b + 8, (size_t) hl));
+        const uint8_t* base = b + 8 + hl;
+        for (auto it = h.begin(); it != h.end(); ++it) {
+            if (it.key() == "__metadata__") continue;
+            StTensor x;
+            x.dtype = it.value().at("dtype").get<std::string>();
+            x.shape = it.value().at("shape").get<std::vector<int64_t>>();
+            const auto off = it.value().at("data_offsets").get<std::vector<size_t>>();
+            if (off.size() != 2 || off[1] < off[0] || base + off[1] > b + size) fail(path + ": bad offsets of " + it.key());
+            x.data = base + off[0];
+            x.bytes = off[1] - off[0];
+            t[it.key()] = x;
+        }
+    }
+    const StTensor* find(const std::string& n) const {
+        auto it = t.find(n);
+        return it == t.end() ? nullptr : &it->second;
+    }
+};
+
+float bf16_to_f32(uint16_t v) {
+    const uint32_t u = (uint32_t) v << 16;
+    float f;
+    std::memcpy(&f, &u, 4);
+    return f;
+}
+
+float fp8_e4m3_to_f32(uint8_t v) {   // e4m3fn: bias 7, no infinities, S.1111.111 is NaN
+    const int sgn = v >> 7, e = (v >> 3) & 15, m = v & 7;
+    float r;
+    if (e == 15 && m == 7) r = NAN;
+    else if (e == 0) r = std::ldexp((float) m / 8.f, -6);
+    else r = std::ldexp(1.f + (float) m / 8.f, e - 7);
+    return sgn ? -r : r;
+}
+
+std::vector<float> st_f32(const StTensor& x, const std::string& name) {
+    size_t n = 1;
+    for (int64_t d : x.shape) n *= (size_t) d;
+    std::vector<float> h(n);
+    if (x.dtype == "F8_E4M3") {
+        if (x.bytes != n) fail(name + ": size");
+        float lut[256];
+        for (int i = 0; i < 256; ++i) lut[i] = fp8_e4m3_to_f32((uint8_t) i);
+        for (size_t i = 0; i < n; ++i) h[i] = lut[x.data[i]];
+    } else if (x.dtype == "BF16") {
+        if (x.bytes != n * 2) fail(name + ": size");
+        for (size_t i = 0; i < n; ++i) {
+            uint16_t v;
+            std::memcpy(&v, x.data + i * 2, 2);
+            h[i] = bf16_to_f32(v);
+        }
+    } else if (x.dtype == "F16") {
+        if (x.bytes != n * 2) fail(name + ": size");
+        strata::dequantize_f16(x.data, h.data(), (int) n);
+    } else if (x.dtype == "F32") {
+        if (x.bytes != n * 4) fail(name + ": size");
+        std::memcpy(h.data(), x.data, n * 4);
+    } else {
+        fail(name + " is " + x.dtype + ", which the EAGLE loader does not read");
+    }
+    return h;
+}
+
+/// f32 rows [n_out][n_in] as GGUF Q8_0 blocks (llama.cpp's quantize_row_q8_0_ref), uploaded with the native GEMV's tail.
+uint8_t* upload_q8_0(const std::vector<float>& w, int n_in, int n_out) {
+    const size_t nb = (size_t) n_in / 32, b = (size_t) n_out * nb * 34;
+    if (b != K::native_mmvq_weight_bytes(8, n_in, n_out)) fail("Q8_0 layout mismatch");
+    std::vector<uint8_t> q(b);
+    for (size_t r = 0; r < (size_t) n_out; ++r)
+        for (size_t k = 0; k < nb; ++k) {
+            const float* x = w.data() + r * (size_t) n_in + k * 32;
+            float amax = 0.f;
+            for (int j = 0; j < 32; ++j) amax = std::max(amax, std::fabs(x[j]));
+            const float d = amax / 127.f, id = d != 0.f ? 1.f / d : 0.f;
+            uint8_t* blk = q.data() + (r * nb + k) * 34;
+            const __half hd = __float2half(d);
+            std::memcpy(blk, &hd, 2);
+            for (int j = 0; j < 32; ++j) blk[2 + j] = (uint8_t) (int8_t) std::lrintf(x[j] * id);
+        }
+    uint8_t* d = nullptr;
+    CK(cudaMalloc(&d, b + 256));
+    CK(cudaMemset(d + b, 0, 256));
+    CK(cudaMemcpy(d, q.data(), b, cudaMemcpyHostToDevice));
+    return d;
+}
+
 // ================================================================================================ the engine
 struct HostShared {          // mapped, pinned host memory the decode graph talks through
     volatile int seq;
@@ -296,7 +433,8 @@ public:
         std::string embd_key; // identity of the images (prefix cache)
     };
     struct GenStats {
-        int n_prompt = 0, n_reused = 0, n_gen = 0, drafted = 0, accepted = 0, windows = 0;
+        int n_prompt = 0, n_reused = 0, n_gen = 0, drafted = 0, accepted = 0, windows = 0, e_drafted = 0,
+            e_accepted = 0, e_windows = 0;
         double prompt_ms = 0, gen_ms = 0;
         std::string finish = "length";
     };
@@ -318,7 +456,8 @@ private:
     void place_experts();
     // forward
     void mm(const Mat& m, const float* x, const void* xq, float* y, int T, cudaStream_t s);
-    void attention(Layer& L, int T, bool window, int pos0);
+    void attention(Layer& L, int T, bool window, int pos0, const int32_t* pos = nullptr, float temp_scale = -1.f,
+                   float temp_floor = 0.f);
     void moe_window(int l, int T);
     void moe_prefill(int l, int T);
     void ffn_dense(Layer& L, int T);
@@ -330,7 +469,27 @@ private:
     void head(int rows_from, int n_rows);   // logits for rows [rows_from, +n) of x
     int sample(const float* logits, const GenParams& gp, std::mt19937_64& rng);
     void count_heat(int l, const int32_t* ids, int n);
+    // EAGLE draft head
+    void load_eagle();
+    void eagle_ffn(Layer& L, int T);
+    void eagle_forward(const int32_t* d_tokens, const float* hid, int T, int pos0, const int32_t* d_pos);
+    void eagle_pick(const float* row, int slot);
+    void eagle_follow(const int32_t* next, int T, int pos0, bool rows_normed);
+    void eagle_chain(int P, int k, double pmin, std::vector<int32_t>& out);
+    bool eagle_on_ = false, eagle_ready_ = false;
+    int eagle_valid_ = 0;          // positions [0, eagle_valid_) have valid EAGLE KV rows
+    Mat efc_;
+    std::vector<Layer> elayers_;
+    float* enorm_ = nullptr;
+    float e_temp_ = 0.f, e_floor_ = 8192.f;
+    int e_ff_ = 0;
+    const float* e_last_ = nullptr;
+    float *mh_ = nullptr, *eemb_ = nullptr, *ecat_ = nullptr, *eg_ = nullptr, *eu_ = nullptr, *eh2_ = nullptr,
+          *eh_ = nullptr, *elogits_ = nullptr, *d_eprob_ = nullptr;
+    void *ecatq_ = nullptr, *ehq_ = nullptr;
+    int32_t *d_etok_ = nullptr, *d_edraft_ = nullptr, *d_epos_ = nullptr, *petok_ = nullptr;
 public:
+    double eagle_acc(const std::vector<int32_t>& ids);
     void dump(const std::vector<int32_t>& ids);
 private:
     void dbg(const char* name, int l, const float* d, int rows, int cols);
@@ -970,6 +1129,7 @@ void Engine::load() {
     read_hparams();
     load_layers();
     alloc_buffers();
+    if (!opt_.eagle.empty() && opt_.mode != "dump" && opt_.mode != "ppl") load_eagle();   // before the experts take VRAM
     // the n-gram table on the other node
     if (opt_.ngram_mib > 0) {
         ngram_bytes_ = (size_t) opt_.ngram_mib << 20;
@@ -995,7 +1155,8 @@ void Engine::load() {
 json Engine::info() const {
     return json{{"model", opt_.model},       {"ctx", opt_.ctx},          {"vocab", hp_.n_vocab},
                 {"kv", opt_.kv == m4k::KV_I8 ? "int8" : "f16"},   {"spec", opt_.spec},
-                {"placement", placement_},    {"numa", opt_.numa},       {"workers", pool_ ? pool_->workers() : 0}};
+                {"placement", placement_},    {"numa", opt_.numa},       {"workers", pool_ ? pool_->workers() : 0},
+                {"eagle", eagle_on_},         {"eagle_k", opt_.eagle_k}, {"eagle_p", opt_.eagle_p}};
 }
 
 void Engine::save_heat() const {
@@ -1078,9 +1239,12 @@ void Engine::embed(const int32_t* d_tokens, int T) {
     K::iq_embed_rows(embd_type_, embd_, embd_row_, d_tokens, T, hp_.n_embd, x_, s_);
 }
 
-void Engine::attention(Layer& L, int T, bool window, int pos0) {
+void Engine::attention(Layer& L, int T, bool window, int pos0, const int32_t* pos, float temp_scale, float temp_floor) {
     const int E = hp_.n_embd, H = hp_.n_head;
-    const int li = (int) (&L - layers_.data());
+    const bool main_layer = &L >= layers_.data() && &L < layers_.data() + layers_.size();
+    const int li = main_layer ? (int) (&L - layers_.data()) : -1000;   // EAGLE layers: no dumps
+    const int32_t* P = pos ? pos : d_pos_;
+    const float ts = temp_scale < 0.f ? hp_.temp_scale : temp_scale, tf = temp_scale < 0.f ? hp_.temp_floor : temp_floor;
     if (li == 0) dbg("inp_embd", -1, x_, T, E);
     m4k::rmsnorm(x_, L.attn_norm, xn_, E, T, E, E, hp_.eps, s_);
     dbg("attn_norm", li, xn_, T, E);
@@ -1098,7 +1262,7 @@ void Engine::attention(Layer& L, int T, bool window, int pos0) {
     }
     mm(L.wkv_a, xn_, xq_, kvp_, T, s_);
     dbg("kv_cmpr_pe", li, kvp_, T, m4k::kKD);
-    m4k::mla_kv_write(kvp_, L.kv_a_norm, rope_, d_pos_, T, opt_.kv, L.kv, L.kv_s, hp_.eps, s_);
+    m4k::mla_kv_write(kvp_, L.kv_a_norm, rope_, P, T, opt_.kv, L.kv, L.kv_s, hp_.eps, s_);
     if (dbg_on_ && opt_.kv == m4k::KV_F16) {   // the cache rows this chunk wrote, as f32: [kv_cmpr (normed) | k_pe (roped)]
         m4k::mla_cache_to_f16(L.kv, L.kv_s, opt_.kv, pos0 + T, K16_, s_);
         std::vector<__half> hh((size_t) T * m4k::kKD);
@@ -1116,10 +1280,10 @@ void Engine::attention(Layer& L, int T, bool window, int pos0) {
     // q_nope absorbed through wk_b: per head [kv_lora x nope] . q_nope -> Qf[t][h][0:256]
     CB(cublasSgemmStridedBatched(cb_, CUBLAS_OP_T, CUBLAS_OP_N, hp_.kv_lora, T, hp_.nope, &one, L.wk_b, hp_.nope,
                                  (long long) hp_.kv_lora * hp_.nope, q_, H * 128, 128, &zero, Qf_, H * m4k::kKD, m4k::kKD, H));
-    m4k::mla_q_rope(q_, Qf_, rope_, d_pos_, T, H, hp_.temp_scale, hp_.temp_floor, s_);
+    m4k::mla_q_rope(q_, Qf_, rope_, P, T, H, ts, tf, s_);
     dbg("Qcur[absorbed|q_pe]", li, Qf_, T * H, m4k::kKD);
     if (window && !opt_.attn_gemm) {
-        m4k::mla_attn_decode(Qf_, L.kv, L.kv_s, opt_.kv, d_pos_, T, H, hp_.kq_scale, part_, Olat_, s_);
+        m4k::mla_attn_decode(Qf_, L.kv, L.kv_s, opt_.kv, P, T, H, hp_.kq_scale, part_, Olat_, s_);
     } else {
         // prompt chunk at positions pos0 .. pos0+T-1: K rows 0 .. pos0+T-1 as f16, S = K^T Q, causal softmax, O = V P
         const int n_kv = pos0 + T;
@@ -1295,6 +1459,303 @@ void Engine::head(int from, int n) {
     m4k::rmsnorm(x_ + (size_t) from * E, out_norm_, xn_, E, n, E, E, hp_.eps, s_);
     q8(xn_, xq_, E, n, s_);
     mm(head_, xn_, xq_, logits_, n, s_);
+}
+
+// ------------------------------------------------------------------------------------------------ EAGLE draft head
+// Mistral's EAGLE head for Mistral Small 4 (vLLM: EagleMistralLarge3ForCausalLM): two DeepSeek-V2 decoder layers (MLA as
+// the model's, a dense SwiGLU FFN), fed per position p with fc([embed(token p+1) | h_p]) where h_p is the model's final
+// hidden state after its output norm; its own output (after its norm) is both the next step's h and the input of the
+// model's head (shared, as are the embeddings).  Positions and rope are the model's; the KV cache is its own.
+void Engine::load_eagle() {
+    const auto t0 = Clock::now();
+    std::string path = opt_.eagle, dir;
+    struct stat stt;
+    if (stat(path.c_str(), &stt) == 0 && S_ISDIR(stt.st_mode)) {
+        dir = path;
+        path += "/consolidated.safetensors";
+    } else {
+        const size_t sl = path.find_last_of('/');
+        dir = sl == std::string::npos ? "." : path.substr(0, sl);
+    }
+    const int E = hp_.n_embd, H = hp_.n_head;
+    int n_layers = 2;
+    float eps = hp_.eps;
+    e_ff_ = 0;
+    {
+        std::ifstream f(dir + "/params.json");
+        if (f) {
+            const json pj = json::parse(f);
+            auto need = [&](const char* k, int v) {
+                if (pj.contains(k) && pj[k].get<int>() != v)
+                    fail(std::string("EAGLE params.json: ") + k + " " + std::to_string(pj[k].get<int>()) + ", the model has " +
+                         std::to_string(v));
+            };
+            need("dim", E);
+            need("n_heads", H);
+            need("q_lora_rank", hp_.q_lora);
+            need("kv_lora_rank", hp_.kv_lora);
+            need("qk_rope_head_dim", hp_.rope);
+            need("qk_nope_head_dim", hp_.nope);
+            need("v_head_dim", hp_.v_dim);
+            n_layers = pj.value("n_layers", 2);
+            e_ff_ = pj.value("hidden_dim", 0);
+            eps = pj.value("norm_eps", (double) hp_.eps);
+            if (pj.contains("llama_4_scaling") && pj["llama_4_scaling"].is_object()) {
+                e_temp_ = pj["llama_4_scaling"].value("beta", 0.0);
+                e_floor_ = pj["llama_4_scaling"].value("original_max_position_embeddings", 8192.0);
+            }
+            if (pj.contains("moe") && !pj["moe"].is_null()) fail("EAGLE head with MoE layers: not supported");
+        } else {
+            logf_("EAGLE: no params.json next to %s, shapes from the tensors", path.c_str());
+        }
+    }
+    if (std::fabs(eps - hp_.eps) > 1e-9) logf_("EAGLE: norm eps %g differs from the model's %g (the model's is used)", eps, hp_.eps);
+    if (hp_.q_lora <= 0) fail("EAGLE: the model has no q_lora (the head needs the MLA q path)");
+    Safetensors st;
+    st.open(path);
+    auto get = [&](const std::string& name, std::vector<int64_t>* shape = nullptr) -> std::vector<float> {
+        const StTensor* t = st.find(name);
+        if (!t) fail("EAGLE: tensor " + name + " missing in " + path);
+        std::vector<float> h = st_f32(*t, name);
+        if (shape) *shape = t->shape;
+        const std::string base = name.size() > 7 && name.compare(name.size() - 7, 7, ".weight") == 0 ? name.substr(0, name.size() - 7) : name;
+        if (const StTensor* sc = st.find(base + ".qscale_weight")) {
+            const std::vector<float> v = st_f32(*sc, base + ".qscale_weight");
+            if (v.size() != 1) fail("EAGLE: " + base + ".qscale_weight is not per tensor");
+            for (float& x : h) x *= v[0];
+        } else if (t->dtype == "F8_E4M3") {
+            fail("EAGLE: " + name + " is float8 without a qscale_weight");
+        }
+        return h;
+    };
+    size_t bytes = 0;
+    auto mat = [&](const std::string& name, int n_in, int n_out) -> Mat {
+        std::vector<int64_t> sh;
+        const std::vector<float> w = get(name, &sh);
+        if (sh.size() != 2 || sh[0] != n_out || sh[1] != n_in)
+            fail("EAGLE: " + name + " shape, expected [" + std::to_string(n_out) + ", " + std::to_string(n_in) + "]");
+        if (name == "eagle_linear.weight" || name == "layers.0.feed_forward.w1.weight") {   // a wrong scale shows here
+            double ss = 0;
+            for (float v : w) ss += (double) v * v;
+            logf_("EAGLE: %s rms %.5f", name.c_str(), std::sqrt(ss / (double) w.size()));
+        }
+        Mat m;
+        m.type = 8;
+        m.n_in = n_in;
+        m.n_out = n_out;
+        m.d = upload_q8_0(w, n_in, n_out);
+        bytes += m.bytes();
+        return m;
+    };
+    auto vec = [&](const std::string& name, int n) -> float* {
+        const std::vector<float> v = get(name);
+        if ((int) v.size() != n) fail("EAGLE: " + name + " has " + std::to_string(v.size()) + " values, expected " + std::to_string(n));
+        bytes += v.size() * 4;
+        return upload(v);
+    };
+    if (e_ff_ <= 0) {
+        const StTensor* t = st.find("layers.0.feed_forward.w1.weight");
+        if (!t || t->shape.size() != 2) fail("EAGLE: layers.0.feed_forward.w1.weight missing");
+        e_ff_ = (int) t->shape[0];
+    }
+    if (e_ff_ % 256) fail("EAGLE: hidden_dim not a multiple of 256");
+    efc_ = mat("eagle_linear.weight", 2 * E, E);
+    elayers_.resize((size_t) n_layers);
+    const size_t kv_row = opt_.kv == m4k::KV_I8 ? m4k::kKD : m4k::kKD * 2;
+    for (int i = 0; i < n_layers; ++i) {
+        Layer& L = elayers_[(size_t) i];
+        const std::string p = "layers." + std::to_string(i) + ".";
+        L.attn_norm = vec(p + "attention_norm.weight", E);
+        L.ffn_norm = vec(p + "ffn_norm.weight", E);
+        L.q_a_norm = vec(p + "attention.q_a_norm.weight", hp_.q_lora);
+        L.kv_a_norm = vec(p + "attention.kv_a_norm.weight", hp_.kv_lora);
+        L.wq_a = mat(p + "attention.wq_a.weight", E, hp_.q_lora);
+        L.wq_b = mat(p + "attention.wq_b.weight", hp_.q_lora, H * 128);
+        L.wkv_a = mat(p + "attention.wkv_a_with_mqa.weight", E, hp_.kv_lora + hp_.rope);
+        L.wo = mat(p + "attention.wo.weight", H * hp_.v_dim, E);
+        {   // kv_b [H * (nope + v_dim)][kv_lora] (per head: nope rows, then v rows) -> the absorbed wk_b, wv_b
+            std::vector<int64_t> sh;
+            const std::vector<float> w = get(p + "attention.wkv_b.weight", &sh);
+            const int per = hp_.nope + hp_.v_dim, C = hp_.kv_lora;
+            if (sh.size() != 2 || sh[0] != (int64_t) H * per || sh[1] != C) fail("EAGLE: " + p + "attention.wkv_b.weight shape");
+            std::vector<float> kb((size_t) H * C * hp_.nope), vb((size_t) H * hp_.v_dim * C);
+            for (int h = 0; h < H; ++h)
+                for (int c = 0; c < C; ++c) {
+                    for (int j = 0; j < hp_.nope; ++j)   // wk_b[h][c][j]
+                        kb[((size_t) h * C + c) * hp_.nope + j] = w[((size_t) h * per + j) * C + c];
+                    for (int v = 0; v < hp_.v_dim; ++v)   // wv_b[h][v][c]
+                        vb[((size_t) h * hp_.v_dim + v) * C + c] = w[((size_t) h * per + hp_.nope + v) * C + c];
+                }
+            L.wk_b = upload(kb);
+            L.wv_b = upload(vb);
+            bytes += (kb.size() + vb.size()) * 4;
+        }
+        L.dense = true;
+        L.ffn_gate = mat(p + "feed_forward.w1.weight", E, e_ff_);
+        L.ffn_up = mat(p + "feed_forward.w3.weight", E, e_ff_);
+        L.ffn_down = mat(p + "feed_forward.w2.weight", e_ff_, E);
+        CK(cudaMalloc(&L.kv, (size_t) opt_.ctx * kv_row));
+        if (opt_.kv == m4k::KV_I8) CK(cudaMalloc(&L.kv_s, (size_t) opt_.ctx * 2 * 4));
+        bytes += (size_t) opt_.ctx * (kv_row + (opt_.kv == m4k::KV_I8 ? 8 : 0));
+    }
+    enorm_ = vec("norm.weight", E);
+    // buffers
+    const size_t T = (size_t) Tm_;
+    auto fa = [&](float** pp, size_t n) { CK(cudaMalloc(pp, n * 4)); bytes += n * 4; };
+    fa(&mh_, T * E);
+    fa(&eemb_, T * E);
+    fa(&ecat_, T * 2 * E);
+    fa(&eg_, T * e_ff_);
+    fa(&eu_, T * e_ff_);
+    fa(&eh2_, T * e_ff_);
+    fa(&eh_, T * E);
+    fa(&elogits_, (size_t) hp_.n_vocab);
+    fa(&d_eprob_, kMaxWin);
+    CK(cudaMalloc(&ecatq_, q8_bytes(2 * E, (int) T) + 1024));
+    CK(cudaMalloc(&ehq_, q8_bytes(e_ff_, (int) T) + 1024));
+    CK(cudaMalloc(&d_etok_, T * 4));
+    CK(cudaMalloc(&d_edraft_, kMaxWin * 4));
+    CK(cudaMalloc(&d_epos_, kMaxWin * 4));
+    CK(cudaHostAlloc((void**) &petok_, (T + 2 * kMaxWin + 4) * 4, 0));   // tokens | chain positions | read-back
+    eagle_on_ = true;
+    logf_("EAGLE head: %d layers, ffn %d, %.2f GiB VRAM (Q8_0 from float8, KV %s), llama-4 scaling %.2f/%g, "
+          "%d drafts max, chain probability >= %.2f, loaded in %.1f s",
+          n_layers, e_ff_, bytes / GiB, opt_.kv == m4k::KV_I8 ? "int8" : "f16", e_temp_, e_floor_, opt_.eagle_k,
+          opt_.eagle_p, ms_since(t0) / 1000.0);
+}
+
+void Engine::eagle_ffn(Layer& L, int T) {
+    const int E = hp_.n_embd, F = e_ff_;
+    m4k::rmsnorm(x_, L.ffn_norm, xn_, E, T, E, E, hp_.eps, s_);
+    q8(xn_, xq_, E, T, s_);
+    mm(L.ffn_gate, xn_, xq_, eg_, T, s_);
+    mm(L.ffn_up, xn_, xq_, eu_, T, s_);
+    const size_t n = (size_t) T * F;
+    swiglu_kernel<<<(unsigned) ((n + 255) / 256), 256, 0, s_>>>(eg_, eu_, eh2_, n);
+    q8(eh2_, ehq_, F, T, s_);
+    mm(L.ffn_down, eh2_, ehq_, ao_, T, s_);
+    m4k::add_inplace(x_, ao_, (size_t) T * E, s_);
+}
+
+/// T rows at positions d_pos (pos0 .. pos0+T-1): tokens d_tokens (the token after each position), hidden rows hid
+/// [T][E]; leaves the head's output (after its norm) in eh_ and its KV rows in the EAGLE cache.
+void Engine::eagle_forward(const int32_t* d_tokens, const float* hid, int T, int pos0, const int32_t* d_pos) {
+    const int E = hp_.n_embd;
+    K::iq_embed_rows(embd_type_, embd_, embd_row_, d_tokens, T, E, eemb_, s_);
+    m4k::concat2(eemb_, hid, ecat_, E, T, s_);
+    q8(ecat_, ecatq_, 2 * E, T, s_);
+    mm(efc_, ecat_, ecatq_, x_, T, s_);
+    for (Layer& L : elayers_) {
+        attention(L, T, T <= kMaxWin, pos0, d_pos, e_temp_, e_floor_);
+        eagle_ffn(L, T);
+    }
+    m4k::rmsnorm(x_, enorm_, eh_, E, T, E, E, hp_.eps, s_);
+}
+
+/// The model's head on one EAGLE row: greedy token and its probability into d_edraft_[slot], d_eprob_[slot].
+void Engine::eagle_pick(const float* row, int slot) {
+    q8(row, xq_, hp_.n_embd, 1, s_);
+    mm(head_, row, xq_, elogits_, 1, s_);
+    m4k::argmax_prob(elogits_, hp_.n_vocab, d_edraft_ + slot, d_eprob_ + slot, s_);
+}
+
+/// After the model ran T rows at positions pos0.. (rows_normed: a window, its head left the normed rows in xn_;
+/// otherwise a prompt chunk with the residual stream in x_): the EAGLE rows for the same positions, with next[i] the
+/// token at pos0+i+1.  Leaves the first draft (the token after next[T-1]) in d_edraft_[0].
+void Engine::eagle_follow(const int32_t* next, int T, int pos0, bool rows_normed) {
+    const int E = hp_.n_embd;
+    if (rows_normed) CK(cudaMemcpyAsync(mh_, xn_, (size_t) T * E * 4, cudaMemcpyDeviceToDevice, s_));
+    else m4k::rmsnorm(x_, out_norm_, mh_, E, T, E, E, hp_.eps, s_);
+    for (int i = 0; i < T; ++i) petok_[i] = next[i];
+    CK(cudaMemcpyAsync(d_etok_, petok_, (size_t) T * 4, cudaMemcpyHostToDevice, s_));
+    eagle_forward(d_etok_, mh_, T, pos0, d_pos_);
+    eagle_pick(eh_ + (size_t) (T - 1) * E, 0);
+    e_last_ = eh_ + (size_t) (T - 1) * E;
+    eagle_ready_ = true;
+    if (pos0 <= eagle_valid_) eagle_valid_ = std::max(eagle_valid_, pos0 + T);
+}
+
+/// Drafts for the window whose first token sits at position P (eagle_follow just ran up to P-1): the first draft is
+/// d_edraft_[0]; each further one is an EAGLE step at P, P+1, ... on its own output.  The chain stops at k drafts or
+/// when the product of the steps' probabilities falls below pmin.
+void Engine::eagle_chain(int P, int k, double pmin, std::vector<int32_t>& out) {
+    out.clear();
+    if (!eagle_ready_ || k <= 0) return;
+    for (int j = 1; j < k; ++j) petok_[Tm_ + j] = P + j - 1;
+    if (k > 1) CK(cudaMemcpyAsync(d_epos_ + 1, petok_ + Tm_ + 1, (size_t) (k - 1) * 4, cudaMemcpyHostToDevice, s_));
+    double cum = 1.0;
+    for (int j = 0; j < k; ++j) {
+        if (j > 0) {
+            eagle_forward(d_edraft_ + (j - 1), e_last_, 1, P + j - 1, d_epos_ + j);
+            eagle_pick(eh_, j);
+            e_last_ = eh_;
+        }
+        int32_t tok = 0;
+        float pr = 0.f;
+        CK(cudaMemcpyAsync(&petok_[Tm_ + kMaxWin], d_edraft_ + j, 4, cudaMemcpyDeviceToHost, s_));
+        CK(cudaMemcpyAsync(&petok_[Tm_ + kMaxWin + 1], d_eprob_ + j, 4, cudaMemcpyDeviceToHost, s_));
+        CK(cudaStreamSynchronize(s_));
+        tok = petok_[Tm_ + kMaxWin];
+        std::memcpy(&pr, &petok_[Tm_ + kMaxWin + 1], 4);
+        cum *= pr;
+        if (cum < pmin || tok < 0 || tok >= hp_.n_vocab) break;
+        out.push_back(tok);
+    }
+    eagle_ready_ = false;   // the chain moved past the model's rows: the next window's eagle_follow renews it
+}
+
+// ------------------------------------------------------------------------------------------------ EAGLE check
+// Teacher-forced top-1 accuracy over chunks of the ids: the model's (row p predicts token p+1) and the EAGLE head's
+// (row p, fed token p+1 and the model's h_p, predicts token p+2), and how often the head agrees with the model's own
+// next pick - the acceptance a greedy draft of one token would get.
+double Engine::eagle_acc(const std::vector<int32_t>& ids) {
+    const int E = hp_.n_embd, C = std::min(512, Tm_);
+    long m_ok = 0, e_ok = 0, e_agree = 0, n_m = 0, n_e = 0, n_a = 0;
+    std::vector<int32_t> mp((size_t) C), ep((size_t) C);
+    const auto t0 = Clock::now();
+    for (size_t a = 0; a + (size_t) C + 1 <= ids.size(); a += (size_t) C) {
+        cached_.clear();
+        eagle_valid_ = 0;
+        const int T = C - 1;   // positions 0 .. C-2; the head reads token p+1 <= C-1
+        std::vector<int32_t> w(ids.begin() + (long) a, ids.begin() + (long) a + C);
+        if (bos_ >= 0) w[0] = bos_;
+        prefill(w.data(), T, 0, nullptr, 0, false);
+        for (int f = 0; f < T; f += kMaxWin) {   // the model's picks (head() normalizes x_ rows into xn_)
+            const int nr = std::min(kMaxWin, T - f);
+            head(f, nr);
+            m4k::argmax_rows(logits_, hp_.n_vocab, nr, d_argmax_, s_);
+            CK(cudaMemcpyAsync(mp.data() + f, d_argmax_, (size_t) nr * 4, cudaMemcpyDeviceToHost, s_));
+        }
+        eagle_follow(w.data() + 1, T, 0, false);
+        for (int f = 0; f < T; f += kMaxWin) {
+            const int nr = std::min(kMaxWin, T - f);
+            q8(eh_ + (size_t) f * E, xq_, E, nr, s_);
+            mm(head_, eh_ + (size_t) f * E, xq_, logits_, nr, s_);
+            m4k::argmax_rows(logits_, hp_.n_vocab, nr, d_argmax_, s_);
+            CK(cudaMemcpyAsync(ep.data() + f, d_argmax_, (size_t) nr * 4, cudaMemcpyDeviceToHost, s_));
+        }
+        CK(cudaStreamSynchronize(s_));
+        for (int p = 0; p < T; ++p) {
+            m_ok += mp[(size_t) p] == w[(size_t) p + 1];
+            ++n_m;
+            if (p + 2 < C) {
+                e_ok += ep[(size_t) p] == w[(size_t) p + 2];
+                ++n_e;
+            }
+            if (p + 1 < T) {
+                e_agree += ep[(size_t) p] == mp[(size_t) p + 1];
+                ++n_a;
+            }
+        }
+        logf_("eagle-acc chunk %zu: model top-1 %.1f %%, EAGLE top-1 %.1f %%, EAGLE = model's next pick %.1f %% (%.1f s)",
+              a / (size_t) C + 1, 100.0 * m_ok / std::max(1L, n_m), 100.0 * e_ok / std::max(1L, n_e),
+              100.0 * e_agree / std::max(1L, n_a), ms_since(t0) / 1000.0);
+    }
+    std::printf("EAGLE-ACC model %.2f %% eagle %.2f %% agree %.2f %%\n", 100.0 * m_ok / std::max(1L, n_m),
+                100.0 * e_ok / std::max(1L, n_e), 100.0 * e_agree / std::max(1L, n_a));
+    cached_.clear();
+    eagle_valid_ = 0;
+    return (double) e_agree / std::max(1L, n_a);
 }
 
 // ------------------------------------------------------------------------------------------------ decode windows
@@ -1587,16 +2048,24 @@ Engine::GenStats Engine::generate(const std::vector<int32_t>& prompt, const GenP
             for (const auto& r : im["rows"]) first = std::min(first, r.get<int>());
         reuse = std::min(reuse, first);
     }
+    const int spec = gp.spec >= 0 ? std::min(gp.spec, kMaxWin - 1) : opt_.spec;
+    // EAGLE rows exist only where the head followed the model; a request without drafts does not keep them
+    const bool use_eagle = eagle_on_ && spec > 0;
+    if (use_eagle) reuse = std::min(reuse, eagle_valid_);
+    else eagle_valid_ = std::min(eagle_valid_, reuse);
+    eagle_ready_ = false;
     st.n_reused = reuse;
     const auto tp = Clock::now();
     for (int a = reuse; a < n - 1; a += opt_.chunk) {
         const int T = std::min(opt_.chunk, n - 1 - a);
-        if (T <= kMaxWin && !(gp.embd.is_array() && !gp.embd.empty())) {
+        const bool win = T <= kMaxWin && !(gp.embd.is_array() && !gp.embd.empty());
+        if (win) {
             std::vector<int32_t> w(prompt.begin() + a, prompt.begin() + a + T);
             run_window(w, a, false);
         } else {
             prefill(prompt.data() + a, T, a, &gp, a, false);
         }
+        if (use_eagle) eagle_follow(prompt.data() + a + 1, T, a, win);
     }
     CK(cudaStreamSynchronize(s_));
     st.prompt_ms = ms_since(tp);
@@ -1608,7 +2077,6 @@ Engine::GenStats Engine::generate(const std::vector<int32_t>& prompt, const GenP
     std::vector<int32_t> hist(prompt.begin(), prompt.end());
     int n_past = n - 1;
     int32_t cur = prompt.back();
-    const int spec = gp.spec >= 0 ? std::min(gp.spec, kMaxWin - 1) : opt_.spec;
     const auto tg = Clock::now();
     std::vector<int32_t> drafts, out;
     double acc_rate = 0.5;
@@ -1629,6 +2097,18 @@ Engine::GenStats Engine::generate(const std::vector<int32_t>& prompt, const GenP
         }
         ngram_.draft(hist, room, drafts, src);
         if (src == 2 && (int) drafts.size() > std::max(1, room / 2)) drafts.resize((size_t) std::max(1, room / 2));
+        // EAGLE drafts wherever the history lookup (source 1: repeated text, code edits) has none
+        bool from_eagle = false;
+        if (use_eagle && !(src == 1 && !drafts.empty())) {
+            std::vector<int32_t> ed;
+            const int ke = std::max(0, std::min({opt_.eagle_k, gp.max_new - st.n_gen - 1, opt_.ctx - n_past - 2}));
+            eagle_chain(n_past, ke, opt_.eagle_p, ed);
+            if (!ed.empty() || src != 2) {
+                drafts = ed;
+                from_eagle = true;
+                src = 3;
+            }
+        }
         if (n_past + 1 + (int) drafts.size() >= opt_.ctx) drafts.clear();
         if (n_past + 1 >= opt_.ctx) { st.finish = "context"; break; }
         std::vector<int32_t> win{cur};
@@ -1659,8 +2139,15 @@ Engine::GenStats Engine::generate(const std::vector<int32_t>& prompt, const GenP
             }
         }
         st.accepted += (int) out.size() - 1;
-        if (!drafts.empty())   // the share of this window's drafts that were taken, averaged over the request
+        if (from_eagle) {
+            st.e_drafted += (int) drafts.size();
+            st.e_accepted += (int) out.size() - 1;
+            ++st.e_windows;
+        } else if (!drafts.empty()) {   // the share of this window's n-gram drafts that were taken, over the request
             acc_rate = 0.7 * acc_rate + 0.3 * (double) ((int) out.size() - 1) / (double) drafts.size();
+        }
+        // the EAGLE head follows the model over the rows that stay (cur and the accepted drafts)
+        if (use_eagle) eagle_follow(out.data(), (int) out.size(), n_past, true);
         // KV rows of cur and the accepted drafts are final
         n_past += (int) out.size();
         std::vector<int32_t> emitted;
@@ -1695,6 +2182,7 @@ double Engine::perplexity(const std::vector<int32_t>& ids, int chunk) {
     int cnt = 0;
     const auto t0 = Clock::now();
     std::vector<float> row((size_t) hp_.n_vocab);
+    eagle_valid_ = 0;
     for (size_t a = 0; a + (size_t) chunk <= ids.size(); a += (size_t) chunk) {
         cached_.clear();
         for (int b = 0; b < chunk; b += kMaxWin) {
@@ -1813,7 +2301,8 @@ int serve(Engine& eng) {
             }, &rd.stop);
             json d{{"n_prompt", st.n_prompt}, {"n_reused", st.n_reused}, {"n_gen", st.n_gen},
                    {"prompt_ms", st.prompt_ms}, {"gen_ms", st.gen_ms}, {"drafted", st.drafted},
-                   {"accepted", st.accepted}, {"windows", st.windows}, {"finish", st.finish}};
+                   {"accepted", st.accepted}, {"windows", st.windows}, {"eagle_drafted", st.e_drafted},
+                   {"eagle_accepted", st.e_accepted}, {"eagle_windows", st.e_windows}, {"finish", st.finish}};
             out_line("DONE " + d.dump());
             if (ms_since(last_heat) > 300000) {
                 eng.save_heat();
@@ -1969,6 +2458,14 @@ int run(int argc, char** argv) {
     Engine eng(o);
     eng.load();
     if (o.mode == "serve") return serve(eng);
+    if (o.mode == "eagle-acc") {
+        std::ifstream f(o.ids_file);
+        std::vector<int32_t> ids;
+        for (int32_t v; f >> v;) ids.push_back(v);
+        logf_("EAGLE accuracy over %zu tokens", ids.size());
+        eng.eagle_acc(ids);
+        return 0;
+    }
     if (o.mode == "ppl") {
         std::ifstream f(o.ids_file);
         std::vector<int32_t> ids;

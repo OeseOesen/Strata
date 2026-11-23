@@ -518,6 +518,46 @@ __global__ void scatter_rows_kernel(const float* src, const int32_t* rows, int n
     for (int d = threadIdx.x; d < n_embd; d += blockDim.x) out[(size_t) rows[i] * n_embd + d] = src[(size_t) i * n_embd + d];
 }
 
+__global__ void concat2_kernel(const float* a, const float* b, float* out, int n) {
+    const int t = blockIdx.x;
+    float* o = out + (size_t) t * 2 * n;
+    for (int d = threadIdx.x; d < n; d += blockDim.x) {
+        o[d] = a[(size_t) t * n + d];
+        o[n + d] = b[(size_t) t * n + d];
+    }
+}
+
+// one block of 1024: argmax (first maximum) and its softmax probability
+__global__ void argmax_prob_kernel(const float* x, int n, int32_t* out, float* prob) {
+    __shared__ float red[32];
+    __shared__ float wb[32];
+    __shared__ int wi[32];
+    float best = -FLT_MAX;
+    int bi = 0x7fffffff;
+    for (int i = threadIdx.x; i < n; i += blockDim.x)
+        if (x[i] > best) { best = x[i]; bi = i; }
+    for (int o = 16; o > 0; o >>= 1) {
+        const float ob = __shfl_xor_sync(0xffffffffu, best, o);
+        const int oi = __shfl_xor_sync(0xffffffffu, bi, o);
+        if (ob > best || (ob == best && oi < bi)) { best = ob; bi = oi; }
+    }
+    if ((threadIdx.x & 31) == 0) { wb[threadIdx.x >> 5] = best; wi[threadIdx.x >> 5] = bi; }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        for (int q = 1; q < (int) (blockDim.x >> 5); ++q)
+            if (wb[q] > wb[0] || (wb[q] == wb[0] && wi[q] < wi[0])) { wb[0] = wb[q]; wi[0] = wi[q]; }
+    }
+    __syncthreads();
+    const float m = wb[0];
+    float sum = 0.f;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) sum += __expf(x[i] - m);
+    sum = block_sum(sum, red);
+    if (threadIdx.x == 0) {
+        *out = wi[0];
+        *prob = 1.f / sum;
+    }
+}
+
 }  // namespace
 
 // ================================================================================================ launchers
@@ -655,6 +695,17 @@ void scatter_rows(const float* src, const int32_t* rows, int n_rows, int n_embd,
     if (n_rows <= 0) return;
     scatter_rows_kernel<<<n_rows, 256, 0, s>>>(src, rows, n_embd, out);
     check("scatter_rows");
+}
+
+void concat2(const float* a, const float* b, float* out, int n, int rows, cudaStream_t s) {
+    if (rows <= 0) return;
+    concat2_kernel<<<rows, 256, 0, s>>>(a, b, out, n);
+    check("concat2");
+}
+
+void argmax_prob(const float* x, int n, int32_t* out, float* prob, cudaStream_t s) {
+    argmax_prob_kernel<<<1, 1024, 0, s>>>(x, n, out, prob);
+    check("argmax_prob");
 }
 
 }  // namespace m4k
