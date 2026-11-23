@@ -269,8 +269,13 @@ class Chat:
                         u = part["image_url"]["url"] if isinstance(part["image_url"], dict) else part["image_url"]
                         images.append(image_bytes_of(u))
         kw = {}
-        if body.get("reasoning_effort") is not None:
-            kw["reasoning_effort"] = body["reasoning_effort"]
+        eff = body.get("reasoning_effort")
+        if eff is None and isinstance(body.get("reasoning"), dict):   # the Responses-style spelling
+            eff = body["reasoning"].get("effort")
+        if eff is not None:
+            # Mistral Small 4 knows two levels: "none" and "high"; agents also send minimal / low / medium / xhigh
+            e = str(eff).strip().lower()
+            kw["reasoning_effort"] = "none" if e in ("none", "off", "minimal", "false", "0", "") else "high"
         msgs, tools = normalize_messages(messages), normalize_tools(body.get("tools"))
 
         def build(ms):
