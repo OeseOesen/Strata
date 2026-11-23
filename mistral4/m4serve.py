@@ -135,6 +135,105 @@ def image_bytes_of(url: str) -> bytes:
 
 
 # ---------------------------------------------------------------------------------------------- the chat format
+_ID9 = __import__("re").compile(r"^[A-Za-z0-9]{9}$")
+_ALNUM = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+
+
+def _id9(raw) -> str:
+    """Mistral's tool call ids are 9 letters / digits; agents send OpenAI's (call_...) or Anthropic's (toolu_...)."""
+    raw = str(raw or "")
+    if _ID9.match(raw):
+        return raw
+    h = hashlib.sha256(raw.encode()).digest()
+    return "".join(_ALNUM[b % len(_ALNUM)] for b in h[:9])
+
+
+def _parts(content):
+    """Content parts mistral-common reads (text, image_url); other spellings of text become text, the rest goes."""
+    if not isinstance(content, list):
+        return content
+    out = []
+    for p in content:
+        if not isinstance(p, dict):
+            continue
+        t = p.get("type")
+        if t in ("text", "input_text", "output_text") and isinstance(p.get("text"), str):
+            out.append({"type": "text", "text": p["text"]})
+        elif t == "image_url":
+            out.append({"type": "image_url", "image_url": p["image_url"]})
+    return out
+
+
+def _text_of(content) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "\n".join(p.get("text", "") for p in content if isinstance(p, dict) and p.get("type") in ("text", "input_text", "output_text"))
+    return ""
+
+
+def normalize_messages(messages: list) -> list:
+    """What agents send, in the shape Mistral's validator accepts: every system / developer message merged into one
+    leading system message; tool call ids as 9 letters / digits (the same mapping for a call and its result); a tool
+    result without an id gets the id of the next open call; empty assistant turns dropped; only the fields
+    mistral-common reads."""
+    systems, rest, open_ids = [], [], []
+    for m in messages or []:
+        if not isinstance(m, dict):
+            continue
+        role = m.get("role")
+        if role in ("system", "developer"):
+            t = _text_of(m.get("content"))
+            if t.strip():
+                systems.append(t)
+            continue
+        if role == "assistant":
+            calls = []
+            for c in m.get("tool_calls") or []:
+                f = c.get("function") or {}
+                args = f.get("arguments", "{}")
+                calls.append({"id": _id9(c.get("id")), "type": "function",
+                              "function": {"name": f.get("name", ""), "arguments": args if isinstance(args, str) else json.dumps(args)}})
+            content = _parts(m.get("content"))
+            if isinstance(content, list) and not any(p.get("type") == "image_url" for p in content):
+                content = _text_of(content)
+            if calls:
+                open_ids = [c["id"] for c in calls]
+                msg = {"role": "assistant", "content": content if (isinstance(content, str) and content.strip()) else None,
+                       "tool_calls": calls}
+            elif isinstance(content, str) and content.strip():
+                msg = {"role": "assistant", "content": content}
+            else:
+                continue
+            rest.append(msg)
+        elif role == "tool":
+            tid = m.get("tool_call_id")
+            tid = _id9(tid) if tid else (open_ids[0] if open_ids else _id9("missing"))
+            if tid in open_ids:
+                open_ids.remove(tid)
+            msg = {"role": "tool", "tool_call_id": tid, "content": _text_of(m.get("content"))}
+            if m.get("name"):
+                msg["name"] = m["name"]
+            rest.append(msg)
+        elif role == "user":
+            content = _parts(m.get("content"))
+            rest.append({"role": "user", "content": content if content not in (None, []) else ""})
+    if systems:
+        rest.insert(0, {"role": "system", "content": "\n\n".join(systems)})
+    return rest
+
+
+def normalize_tools(tools):
+    out = []
+    for t in tools or []:
+        f = (t or {}).get("function") if isinstance(t, dict) else None
+        if not f or not f.get("name"):
+            continue
+        out.append({"type": "function", "function": {"name": f["name"], "description": f.get("description", ""),
+                                                     "parameters": f.get("parameters") or {"type": "object", "properties": {}}}})
+    return out or None
+
+
 class Chat:
     def __init__(self, tokenizer: str):
         if os.path.exists(tokenizer):
@@ -172,8 +271,20 @@ class Chat:
         kw = {}
         if body.get("reasoning_effort") is not None:
             kw["reasoning_effort"] = body["reasoning_effort"]
-        req = ChatCompletionRequest.from_openai(messages, tools=body.get("tools"), **kw)
-        tokd = self.mt.encode_chat_completion(req)
+        msgs, tools = normalize_messages(messages), normalize_tools(body.get("tools"))
+
+        def build(ms):
+            r = ChatCompletionRequest.from_openai(ms, tools=tools, **kw)
+            if r.messages and getattr(r.messages[-1], "role", None) == "assistant" and hasattr(r.messages[-1], "prefix"):
+                r.messages[-1].prefix = True   # a trailing assistant turn is continued, not answered
+            return self.mt.encode_chat_completion(r)
+        try:
+            tokd = build(msgs)
+        except Exception as e:
+            if "not both" not in str(e):
+                raise
+            # older validators: an assistant turn has text or tool calls, not both - keep the calls
+            tokd = build([{**m, "content": None} if m.get("role") == "assistant" and m.get("tool_calls") else m for m in msgs])
         ids = list(tokd.tokens)
         embd, key = [], ""
         if images:
@@ -488,7 +599,8 @@ def make_handler(S: State):
                 return self._chat(body)
             if self.path == "/v1/completions":
                 return self._completion(body)
-            self._json(404, {"error": {"message": "not found"}})
+            log(f"404: POST {self.path} (this server speaks /v1/chat/completions and /v1/completions)")
+            self._json(404, {"error": {"message": f"not found: {self.path}; use /v1/chat/completions"}})
 
         # -- the engine request
         def _gen_req(self, body: dict, ids: list[int], embd, key: str) -> dict:
@@ -507,7 +619,8 @@ def make_handler(S: State):
             try:
                 ids, embd, key = S.chat.encode(body, S.vision)
             except Exception as e:
-                return self._json(400, {"error": {"message": str(e)}})
+                log(f"400 on /v1/chat/completions: {type(e).__name__}: {e}")
+                return self._json(400, {"error": {"message": f"{type(e).__name__}: {e}", "type": "invalid_request_error"}})
             req = self._gen_req(body, ids, embd, key)
             stream = bool(body.get("stream"))
             rid = "chatcmpl-" + uuid.uuid4().hex[:24]
