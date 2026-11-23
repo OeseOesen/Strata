@@ -451,8 +451,13 @@ public:
         double prompt_ms = 0, gen_ms = 0;
         std::string finish = "length";
     };
+    struct GenHooks {   // optional live reports (the serve protocol's PP and W lines)
+        std::function<void(int, int, int)> progress;   // prompt tokens read, to read, reused
+        std::function<void(int, int)> window;          // rows in the window, rows taken
+    };
     GenStats generate(const std::vector<int32_t>& prompt, const GenParams& gp,
-                      const std::function<bool(const std::vector<int32_t>&)>& emit, const std::atomic<bool>* stop);
+                      const std::function<bool(const std::vector<int32_t>&)>& emit, const std::atomic<bool>* stop,
+                      const GenHooks* hooks = nullptr);
     double perplexity(const std::vector<int32_t>& ids, int chunk);
     void save_heat() const;
     const Hp& hp() const { return hp_; }
@@ -2049,7 +2054,7 @@ void Engine::dump(const std::vector<int32_t>& ids) {
 // ------------------------------------------------------------------------------------------------ generation
 Engine::GenStats Engine::generate(const std::vector<int32_t>& prompt, const GenParams& gp,
                                   const std::function<bool(const std::vector<int32_t>&)>& emit,
-                                  const std::atomic<bool>* stop) {
+                                  const std::atomic<bool>* stop, const GenHooks* hooks) {
     GenStats st;
     const int n = (int) prompt.size();
     st.n_prompt = n;
@@ -2085,6 +2090,10 @@ Engine::GenStats Engine::generate(const std::vector<int32_t>& prompt, const GenP
             prefill(prompt.data() + a, T, a, &gp, a, false);
         }
         if (use_eagle) eagle_follow(prompt.data() + a + 1, T, a, win);
+        if (hooks && hooks->progress) {
+            CK(cudaStreamSynchronize(s_));
+            hooks->progress(a + T - reuse, n - 1 - reuse, reuse);
+        }
     }
     CK(cudaStreamSynchronize(s_));
     st.prompt_ms = ms_since(tp);
@@ -2165,6 +2174,7 @@ Engine::GenStats Engine::generate(const std::vector<int32_t>& prompt, const GenP
         } else if (!drafts.empty()) {   // the share of this window's n-gram drafts that were taken, over the request
             acc_rate = 0.7 * acc_rate + 0.3 * (double) ((int) out.size() - 1) / (double) drafts.size();
         }
+        if (hooks && hooks->window) hooks->window(T, (int) out.size());
         // the EAGLE head follows the model over the rows that stay (cur and the accepted drafts)
         if (use_eagle) eagle_follow(out.data(), (int) out.size(), n_past, true);
         // KV rows of cur and the accepted drafts are final
@@ -2312,12 +2322,17 @@ int serve(Engine& eng) {
                 continue;
             }
             rd.stop.store(false);
+            Engine::GenHooks hk;
+            hk.progress = [](int done, int total, int reused) {
+                out_line("PP " + std::to_string(done) + " " + std::to_string(total) + " " + std::to_string(reused));
+            };
+            hk.window = [](int rows, int taken) { out_line("W " + std::to_string(rows) + " " + std::to_string(taken)); };
             const auto st = eng.generate(ids, gp, [&](const std::vector<int32_t>& t) {
                 std::string s = "T";
                 for (int32_t v : t) s += " " + std::to_string(v);
                 out_line(s);
                 return true;
-            }, &rd.stop);
+            }, &rd.stop, &hk);
             json d{{"n_prompt", st.n_prompt}, {"n_reused", st.n_reused}, {"n_gen", st.n_gen},
                    {"prompt_ms", st.prompt_ms}, {"gen_ms", st.gen_ms}, {"drafted", st.drafted},
                    {"accepted", st.accepted}, {"windows", st.windows}, {"eagle_drafted", st.e_drafted},

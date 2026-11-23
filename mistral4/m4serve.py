@@ -64,8 +64,9 @@ class Engine:
                 break
         log("engine ready:", json.dumps(self.info))
 
-    def generate(self, req: dict, on_tokens, cancelled) -> dict:
-        """Runs one GEN; on_tokens(list[int]) per accepted window; returns the DONE stats."""
+    def generate(self, req: dict, on_tokens, cancelled, on_progress=None, on_window=None) -> dict:
+        """Runs one GEN; on_tokens(list[int]) per accepted window; on_progress(read, total, reused) per prompt chunk,
+        on_window(rows, taken) per decode window; returns the DONE stats."""
         self.p.stdin.write("GEN " + json.dumps(req) + "\n")
         self.p.stdin.flush()
         stopped = False
@@ -81,6 +82,15 @@ class Engine:
                     stopped = True
                 if not stopped:
                     on_tokens(ids)
+            elif line.startswith("PP ") or line.startswith("W "):
+                try:
+                    f = [int(x) for x in line.split()[1:]]
+                    if line[0] == "P" and on_progress and len(f) == 3:
+                        on_progress(*f)
+                    elif line[0] == "W" and on_window and len(f) == 2:
+                        on_window(*f)
+                except ValueError:
+                    pass
             elif line.startswith("DONE"):
                 return json.loads(line[5:] or "{}")
             elif line.startswith("ERR"):
@@ -409,6 +419,7 @@ class Telemetry:
         self.last_answer = None
         self.last_prefill = None
         self.devices: list[dict] = []
+        self.windows = collections.deque(maxlen=512)   # (time, rows, taken) per decode window
         threading.Thread(target=self._sample_gpus, daemon=True).start()
 
     # -- request transitions
@@ -431,6 +442,27 @@ class Telemetry:
             self.cur = {**row, "state": "reading", "admitted_at": now, "generated": 0, "first_at": None}
             self._event(rid, "admitted")
             self._event(rid, "reading")
+
+    def progress(self, read: int, total: int, reused: int):
+        with self.lock:
+            if self.cur is not None:
+                self.cur["prompt_tokens"] = total + reused + 1   # + the last prompt token (read by the first window)
+                self.cur["prompt_read"] = reused + read
+
+    def window(self, rows: int, taken: int):
+        with self.lock:
+            self.windows.append((time.time(), min(8, max(1, rows)), min(8, max(1, taken))))
+
+    def _batch(self, now: float) -> dict:
+        """The decode windows of the last 10 s (or the last 64 of the last minute): rows per window (1 + drafts) and
+        rows taken (1 + accepted drafts), Strata's batch-window sample fields."""
+        w = [x for x in self.windows if now - x[0] <= 10] or [x for x in list(self.windows)[-64:] if now - x[0] <= 60]
+        if len(w) < 2:
+            return {}
+        return {"batch_sample_windows": len(w), "batch_sample_rows": sum(x[1] for x in w),
+                "batch_sample_active_rows": sum(x[2] for x in w),
+                "batch_sample_span_s": round(max(1e-3, w[-1][0] - w[0][0]), 3),
+                "batch_sample_age_s": round(max(0.0, now - w[-1][0]), 3)}
 
     def tokens(self, n: int):
         with self.lock:
@@ -513,7 +545,8 @@ class Telemetry:
                 live_rate = (c["generated"] / (now - c["first_at"])) if c["first_at"] and now > c["first_at"] and c["generated"] > 1 else None
                 slot = {"slot": 0, "group": None, "replica": None, "request_id": c["id"], "state": c["state"],
                         "held_tokens": None, "prompt_tokens": c.get("prompt_tokens"),
-                        "prompt_read": c.get("prompt_tokens") if c["first_at"] else None, "generated": c["generated"],
+                        "prompt_read": c.get("prompt_tokens") if c["first_at"] else c.get("prompt_read"),
+                        "generated": c["generated"],
                         "elapsed_s": round(now - c["admitted_at"], 2), "tok_s": round(live_rate, 1) if live_rate else None}
             else:
                 live_rate = None
@@ -534,7 +567,7 @@ class Telemetry:
                 "work": {"slots_requested": 1, "slots_effective": 1, "active": 1 if c else 0, "queued": len(queue),
                          "waiting": len(queue), "outside_slots": 0, "groups": None, "requests_omitted": 0,
                          "oldest_queue_s": round(max((now - r["queued_at"] for r in queue), default=0), 2),
-                         "slots": [slot], "requests": requests[:50]},
+                         "slots": [slot], "requests": requests[:50], **self._batch(now)},
                 "rates": {"answer_tok_s": round(answer[0], 1) if answer[0] else None,
                           "answer_window_s": round(answer[1], 2) if answer[1] else None,
                           "prefill_tok_s": round(self.last_prefill, 1) if self.last_prefill else None,
@@ -581,7 +614,7 @@ def make_handler(S: State):
                 def tok(ids_):
                     S.tele.tokens(len(ids_))
                     on_tokens(ids_)
-                st = S.engine.generate(req, tok, cancelled)
+                st = S.engine.generate(req, tok, cancelled, S.tele.progress, S.tele.window)
             fin = st.get("finish")
             outcome = "stop" if fin == "stop" else "length" if fin in ("length", "context") else \
                 "disconnect" if cancelled() else "cancel" if fin == "abort" else "error"
