@@ -89,4 +89,9 @@ void concat2(const float* a, const float* b, float* out, int n, int rows, cudaSt
 /// One row: the first maximum and its softmax probability.
 void argmax_prob(const float* x, int n, int32_t* out, float* prob, cudaStream_t s);
 
+/// Prompt experts on the tensor cores: out[i] = f16(x[rows[i]]) (rows of `cols` floats).
+void gather_rows_f16(const float* x, const int32_t* rows, int n, int cols, __half* out, cudaStream_t s);
+/// h[i][f] = f16(silu(gu[i][f]) * gu[i][F + f]) for rows of [gate | up] (2F floats).
+void swiglu_f16(const float* gu, int n, int F, __half* h, cudaStream_t s);
+
 }  // namespace m4k

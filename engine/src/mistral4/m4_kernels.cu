@@ -705,6 +705,22 @@ __global__ void argmax_prob_kernel(const float* x, int n, int32_t* out, float* p
     }
 }
 
+__global__ void gather_rows_f16_kernel(const float* x, const int32_t* rows, int cols, __half* out) {
+    const int i = blockIdx.x;
+    const float* src = x + (size_t) rows[i] * cols;
+    __half* dst = out + (size_t) i * cols;
+    for (int d = threadIdx.x; d < cols; d += blockDim.x) dst[d] = __float2half(src[d]);
+}
+
+__global__ void swiglu_f16_kernel(const float* gu, int F, __half* h) {
+    const int i = blockIdx.x;
+    const float* g = gu + (size_t) i * 2 * F;
+    for (int f = threadIdx.x; f < F; f += blockDim.x) {
+        const float a = g[f];
+        h[(size_t) i * F + f] = __float2half(a / (1.f + __expf(-a)) * g[F + f]);
+    }
+}
+
 }  // namespace
 
 // ================================================================================================ launchers
@@ -870,6 +886,18 @@ void concat2(const float* a, const float* b, float* out, int n, int rows, cudaSt
 void argmax_prob(const float* x, int n, int32_t* out, float* prob, cudaStream_t s) {
     argmax_prob_kernel<<<1, 1024, 0, s>>>(x, n, out, prob);
     check("argmax_prob");
+}
+
+void gather_rows_f16(const float* x, const int32_t* rows, int n, int cols, __half* out, cudaStream_t s) {
+    if (n <= 0) return;
+    gather_rows_f16_kernel<<<n, 256, 0, s>>>(x, rows, cols, out);
+    check("gather_rows_f16");
+}
+
+void swiglu_f16(const float* gu, int n, int F, __half* h, cudaStream_t s) {
+    if (n <= 0) return;
+    swiglu_f16_kernel<<<n, 256, 0, s>>>(gu, F, h);
+    check("swiglu_f16");
 }
 
 }  // namespace m4k

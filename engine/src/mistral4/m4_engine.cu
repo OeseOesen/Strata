@@ -21,6 +21,7 @@
 #include "strata/artifact/dequant.hpp"
 #include "strata/artifact/gguf_reader.hpp"
 #include "strata/kernels/cpu/native_expert.hpp"
+#include "strata/kernels/dequant_bf16.hpp"
 #include "strata/kernels/iq_kernels.hpp"
 #include "strata/kernels/native_mmvq.hpp"
 
@@ -116,6 +117,10 @@ struct Options {
     int ctx = 65536, chunk = 512, spec = 6, kv = m4k::KV_I8, workers = -1, host_core = -1, bench_pp = 512,
         bench_tg = 128, ngram_mib = 1024, seed = 0, gpu = 0, ppl_ctx = 512, attn_impl = m4k::ATTN_TC;
     double attn_temp_scale = -1;   // < 0: the GGUF's
+    // prompt path: experts not in VRAM streamed to the GPU over PCIe (pinned arenas, a ring of slots on a copy stream)
+    // and every product of a chunk on the tensor cores (weights dequantized to f16, cuBLAS) - Strata's prompt trick
+    int pf_stream = 1, pf_min = 768, pf_ring = 12;
+    bool pf_gemm = true, chunk_set = false;
     double vram_reserve = 1.5, vram_experts = -1, ram_gpu_node = -1, ram_other_node = -1;
     std::string eagle;            // EAGLE draft head: Mistral's consolidated.safetensors (or its folder)
     int eagle_k = 3;              // drafts per window at most (Mistral recommends 3)
@@ -137,7 +142,13 @@ void usage() {
                  "  --no-attn-temp           debug: ignore the GGUF's attention temperature scaling (llama-4 style, > 8k)\n"
                  "  --ctx N                  context (default 65536; the int8 latent cache costs 11.5 KiB per token)\n"
                  "  --kv int8|f16            latent cache format (default int8)\n"
-                 "  --chunk N                prompt chunk (default 512)\n"
+                 "  --chunk N                prompt chunk (default 2048 with --pf-stream 1, else 512)\n"
+                 "  --pf-stream 0|1          prompt chunks of --pf-min tokens or more stream the experts that are not in VRAM\n"
+                 "                           to the GPU (pinned arenas, DMA on a copy stream) and run every expert there on\n"
+                 "                           the tensor cores; 0 = the CPU pool computes them (default 1)\n"
+                 "  --pf-min N               smallest chunk that streams (default 768; below it the CPU pool is faster)\n"
+                 "  --pf-ring N              expert slots of the stream ring in VRAM (default 12)\n"
+                 "  --pf-gemm 0|1            prompt chunks of 64+ tokens: dense products as f16 tensor-core GEMMs (default 1)\n"
                  "  --spec N                 n-gram draft tokens per window, 0 = off (default 6, max 15)\n"
                  "  --vram-reserve GiB       VRAM left free (default 1.5)\n"
                  "  --vram-experts GiB       cap on VRAM expert slots (default: all that is left)\n"
@@ -184,7 +195,11 @@ Options parse(int argc, char** argv) {
         else if (a == "--dump-layers") o.dump_layers = next();
         else if (a == "--ctx") o.ctx = std::stoi(next());
         else if (a == "--kv") { const std::string v = next(); o.kv = v == "f16" ? m4k::KV_F16 : m4k::KV_I8; }
-        else if (a == "--chunk") o.chunk = std::stoi(next());
+        else if (a == "--chunk") { o.chunk = std::stoi(next()); o.chunk_set = true; }
+        else if (a == "--pf-stream") o.pf_stream = std::stoi(next());
+        else if (a == "--pf-min") o.pf_min = std::stoi(next());
+        else if (a == "--pf-ring") o.pf_ring = std::stoi(next());
+        else if (a == "--pf-gemm") o.pf_gemm = std::stoi(next()) != 0;
         else if (a == "--spec") o.spec = std::stoi(next());
         else if (a == "--vram-reserve") o.vram_reserve = std::stod(next());
         else if (a == "--vram-experts") o.vram_experts = std::stod(next());
@@ -216,7 +231,9 @@ Options parse(int argc, char** argv) {
     o.spec = std::max(0, std::min(o.spec, kMaxWin - 1));
     o.eagle_k = std::max(1, std::min(o.eagle_k, kMaxWin - 1));
     if (o.mode == "eagle-acc" && o.eagle.empty()) fail("--eagle-acc needs --eagle");
+    if (!o.chunk_set && o.pf_stream) o.chunk = 2048;
     o.chunk = std::max(kMaxWin + 1, o.chunk);
+    o.pf_ring = std::max(2, std::min(o.pf_ring, 64));
     if (o.heat.empty()) o.heat = o.model + ".m4heat";
     return o;
 }
@@ -478,6 +495,11 @@ private:
                    float temp_floor = 0.f);
     void moe_window(int l, int T);
     void moe_prefill(int l, int T);
+    void moe_prefill_stream(int l, int T);
+    bool stream_ok(const Layer& L) const;
+    void ensure_w16(size_t elems);
+    void ensure_x16(size_t elems);
+    void register_arenas();
     void ffn_dense(Layer& L, int T);
     void embed(const int32_t* d_tokens, int T);
     void enqueue_window(int T);
@@ -500,7 +522,7 @@ private:
     std::vector<Layer> elayers_;
     float* enorm_ = nullptr;
     float e_temp_ = 0.f, e_floor_ = 8192.f;
-    int e_ff_ = 0;
+    int e_ff_ = 0, e_rows_ = 512;
     const float* e_last_ = nullptr;
     float *mh_ = nullptr, *eemb_ = nullptr, *ecat_ = nullptr, *eg_ = nullptr, *eu_ = nullptr, *eh2_ = nullptr,
           *eh_ = nullptr, *elogits_ = nullptr, *d_eprob_ = nullptr;
@@ -534,6 +556,18 @@ private:
     void* ngram_mem_ = nullptr;
     size_t ngram_bytes_ = 0;
     std::vector<std::pair<void*, size_t>> arenas_;
+    // the streamed prompt path
+    cudaStream_t cs_ = nullptr;                       // copy stream
+    std::vector<cudaEvent_t> ev_copied_, ev_free_;     // per ring slot
+    uint8_t* ring_ = nullptr;
+    size_t ring_stride_ = 0;
+    uint64_t ring_seq_ = 0;                            // ring uses so far (slot = seq % ring size)
+    __half *W16_ = nullptr, *X16_ = nullptr, *H16_ = nullptr;
+    size_t W16_elems_ = 0, X16_elems_ = 0;
+    float* GU_ = nullptr;
+    int32_t *d_rpos_ = nullptr, *d_noslot_ = nullptr, *d_rows_ = nullptr, *prpos_ = nullptr, *prows_ = nullptr;
+    bool pinned_arenas_ = false;
+    double pf_stream_bytes_ = 0;
     std::vector<std::vector<uint64_t>> heat_;
     std::string placement_;
     // device buffers
@@ -896,6 +930,73 @@ void Engine::alloc_buffers() {
     CK(cudaMalloc(&cb_ws_, (size_t) 32 << 20));
     CB(cublasSetWorkspace(cb_, cb_ws_, (size_t) 32 << 20));
     CB(cublasSetMathMode(cb_, CUBLAS_DEFAULT_MATH));
+    // the streamed prompt path: a ring of expert slots, f16 scratch for one expert's (or one dense) weights and a
+    // chunk's rows, the routes' order tables
+    if (opt_.pf_stream) {
+        const int F = hp_.n_ff;
+        for (const Layer& L : layers_) {
+            if (L.dense) continue;
+            ring_stride_ = std::max(ring_stride_, L.stride ? L.stride : (L.fmt.bytes + 255) / 256 * 256);
+        }
+        CK(cudaStreamCreateWithFlags(&cs_, cudaStreamNonBlocking));
+        CK(cudaMalloc(&ring_, (size_t) opt_.pf_ring * ring_stride_ + 4096));
+        ev_copied_.resize((size_t) opt_.pf_ring);
+        ev_free_.resize((size_t) opt_.pf_ring);
+        for (int i = 0; i < opt_.pf_ring; ++i) {
+            CK(cudaEventCreateWithFlags(&ev_copied_[(size_t) i], cudaEventDisableTiming));
+            CK(cudaEventCreateWithFlags(&ev_free_[(size_t) i], cudaEventDisableTiming));
+        }
+        CK(cudaMalloc(&GU_, T * 2 * F * 4));
+        CK(cudaMalloc(&H16_, T * F * 2));
+        CK(cudaMalloc(&d_rpos_, T * k * 4));
+        CK(cudaMalloc(&d_rows_, T * k * 4));
+        CK(cudaMalloc(&d_noslot_, (size_t) hp_.n_expert * 4));
+        CK(cudaMemset(d_noslot_, 0xff, (size_t) hp_.n_expert * 4));   // -1: every route reads its sorted row
+        CK(cudaHostAlloc((void**) &prpos_, T * k * 4, 0));
+        CK(cudaHostAlloc((void**) &prows_, T * k * 4, 0));
+        logf_("prompt streaming: chunks of %d+ tokens, ring of %d expert slots (%.2f GiB)", opt_.pf_min, opt_.pf_ring,
+              (double) opt_.pf_ring * ring_stride_ / GiB);
+    }
+    if (opt_.pf_stream || opt_.pf_gemm) {
+        ensure_w16((size_t) 2 * hp_.n_ff * E);
+        ensure_x16((size_t) T * std::max(E, H * hp_.v_dim));
+    }
+}
+
+void Engine::ensure_w16(size_t elems) {
+    if (elems <= W16_elems_) return;
+    if (W16_) CK(cudaFree(W16_));
+    CK(cudaMalloc(&W16_, elems * 2));
+    W16_elems_ = elems;
+}
+
+void Engine::ensure_x16(size_t elems) {
+    if (elems <= X16_elems_) return;
+    if (X16_) CK(cudaFree(X16_));
+    CK(cudaMalloc(&X16_, elems * 2));
+    X16_elems_ = elems;
+}
+
+/// The host arenas pinned for DMA (cudaHostRegister): the copy engine then reads the experts straight from both nodes'
+/// memory.  A refusal is not fatal: the copies then go through the driver's staging (slower).
+void Engine::register_arenas() {
+    if (!opt_.pf_stream || arenas_.empty()) return;
+    const auto t0 = Clock::now();
+    double gib = 0;
+    bool ok = true;
+    for (const auto& a : arenas_) {
+        const cudaError_t e = cudaHostRegister(a.first, a.second, cudaHostRegisterPortable);
+        if (e != cudaSuccess) {
+            (void) cudaGetLastError();
+            logf_("prompt streaming: pinning %.2f GiB of expert arena failed (%s); copies go through staging",
+                  a.second / GiB, cudaGetErrorString(e));
+            ok = false;
+            continue;
+        }
+        gib += a.second / GiB;
+    }
+    pinned_arenas_ = ok;
+    logf_("prompt streaming: %.2f GiB of expert arenas pinned for DMA in %.1f s", gib, ms_since(t0) / 1000.0);
 }
 
 // ------------------------------------------------------------------------------------------------ expert placement
@@ -1102,6 +1203,7 @@ void Engine::place_experts() {
                       n_o, other_node_, need_oth / GiB, n_f, ms_since(t0) / 1000.0);
     placement_ = buf;
     logf_("%s", buf);
+    register_arenas();
 }
 
 void Engine::load() {
@@ -1243,6 +1345,18 @@ void Engine::mm(const Mat& m, const float* x, const void* xq, float* y, int T, c
     if (m.f) {
         const float one = 1.f, zero = 0.f;
         CB(cublasSgemm(cb_, CUBLAS_OP_T, CUBLAS_OP_N, m.n_out, T, m.n_in, &one, m.f, m.n_in, x, m.n_in, &zero, y, m.n_out));
+        return;
+    }
+    if (opt_.pf_gemm && T >= 64 && K::dequant_bf16_supported(m.type)) {
+        // a prompt chunk: the weights dequantized to f16 once, one tensor-core GEMM (the q8_1 path would read the
+        // weights T/8 times)
+        const float one = 1.f, zero = 0.f;
+        ensure_w16((size_t) m.n_in * m.n_out);
+        ensure_x16((size_t) T * m.n_in);
+        K::dequant_f16(m.type, m.d, 0, m.n_out, m.n_in, (uint16_t*) W16_, s);
+        m4k::f32_to_f16_scaled(x, X16_, (size_t) T * m.n_in, 1.f, s);
+        CB(cublasGemmEx(cb_, CUBLAS_OP_T, CUBLAS_OP_N, m.n_out, T, m.n_in, &one, W16_, CUDA_R_16F, m.n_in, X16_, CUDA_R_16F,
+                        m.n_in, &zero, y, CUDA_R_32F, m.n_out, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
         return;
     }
     const size_t col = q8_bytes(m.n_in, 1);
@@ -1484,6 +1598,114 @@ void Engine::head(int from, int n) {
     mm(head_, xn_, xq_, logits_, n, s_);
 }
 
+// ------------------------------------------------------------------------------------------------ streamed prompt MoE
+// Strata's prompt trick for this machine: a chunk of hundreds or thousands of tokens routes to nearly every expert of
+// every layer, which the CPU pool computes at ~200 tok/s.  Here every expert of the chunk runs on the GPU instead:
+// the ones in VRAM from their slot, the others DMA'd from the pinned arenas of both nodes into a ring of VRAM slots on
+// a copy stream (the split policy's halves reassembled on the way), while the compute stream dequantizes each expert
+// to f16 and runs gate/up, SwiGLU and down as tensor-core GEMMs over the expert's rows.  PCIe Gen3 x16 moves the
+// ~37 GB of CPU experts in ~3 s, so a 2048-token chunk reads at ~700 tok/s, 4096 at ~1300 (the copies dominate).
+bool Engine::stream_ok(const Layer& L) const {
+    return opt_.pf_stream && ring_ && !L.dense && K::dequant_bf16_supported(L.gu_type) &&
+           K::dequant_bf16_supported(L.d_type);
+}
+
+void Engine::moe_prefill_stream(int l, int T) {
+    Layer& L = layers_[(size_t) l];
+    const int E = hp_.n_embd, k = hp_.top_k, R = T * k, F = hp_.n_ff, NE = hp_.n_expert;
+    const float one = 1.f, zero = 0.f;
+    m4k::rmsnorm(x_, L.ffn_norm, xn_, E, T, E, E, hp_.eps, s_);
+    CB(cublasSgemm(cb_, CUBLAS_OP_T, CUBLAS_OP_N, NE, T, E, &one, L.router, E, xn_, E, &zero, rlog_, NE));
+    m4k::router_topk(rlog_, L.probs_b, NE, k, T, hp_.gating, hp_.w_norm, hp_.w_scale, d_ids_, w_, s_);
+    CK(cudaMemcpyAsync(pids_, d_ids_, (size_t) R * 4, cudaMemcpyDeviceToHost, s_));
+    CK(cudaStreamSynchronize(s_));
+    count_heat(l, pids_, R);
+    // the routes sorted by expert: prows_[i] = the token of sorted route i, prpos_[route] = its sorted row
+    std::vector<int> cnt((size_t) NE + 1, 0), off((size_t) NE + 1, 0);
+    for (int r = 0; r < R; ++r) ++cnt[(size_t) pids_[r]];
+    for (int e = 0; e < NE; ++e) off[(size_t) e + 1] = off[(size_t) e] + cnt[(size_t) e];
+    {
+        std::vector<int> fill(off.begin(), off.end() - 1);
+        for (int r = 0; r < R; ++r) {
+            const int i = fill[(size_t) pids_[r]]++;
+            prows_[i] = r / k;
+            prpos_[r] = i;
+        }
+    }
+    CK(cudaMemcpyAsync(d_rows_, prows_, (size_t) R * 4, cudaMemcpyHostToDevice, s_));
+    CK(cudaMemcpyAsync(d_rpos_, prpos_, (size_t) R * 4, cudaMemcpyHostToDevice, s_));
+    // the shared expert (dense GEMMs)
+    const int Fs = F * std::max(1, hp_.n_shexp);
+    q8(xn_, xq_, E, T, s_);
+    mm(L.sh_gate, xn_, xq_, g_, T, s_);
+    mm(L.sh_up, xn_, xq_, u_, T, s_);
+    {
+        const size_t n = (size_t) T * Fs;
+        swiglu_kernel<<<(unsigned) ((n + 255) / 256), 256, 0, s_>>>(g_, u_, h_, n);
+    }
+    q8(h_, hq_, Fs, T, s_);
+    mm(L.sh_down, h_, hq_, sh_, T, s_);
+    // where each expert's bytes come from; the order: VRAM experts first (they need no copy), then the streamed ones
+    const size_t gu_row = L.fmt.gu_row, d_row = L.fmt.d_row;
+    const size_t up_off = L.stride ? L.L.up_off : (size_t) F * gu_row;
+    const size_t down_off = L.stride ? L.L.down_off : 2 * (size_t) F * gu_row;
+    std::vector<int> resident, streamed;
+    for (int e = 0; e < NE; ++e) {
+        if (!cnt[(size_t) e]) continue;
+        (L.slot_of[(size_t) e] >= 0 ? resident : streamed).push_back(e);
+    }
+    const int RN = opt_.pf_ring;
+    const uint64_t seq0 = ring_seq_;
+    int issued = 0;
+    auto issue = [&](int upto) {   // the copies of streamed experts [issued, upto)
+        for (; issued < upto && issued < (int) streamed.size(); ++issued) {
+            const int e = streamed[(size_t) issued];
+            const int slot = (int) ((seq0 + (uint64_t) issued) % (uint64_t) RN);
+            uint8_t* dst = ring_ + (size_t) slot * ring_stride_;
+            CK(cudaStreamWaitEvent(cs_, ev_free_[(size_t) slot], 0));   // the slot's previous expert is computed
+            const CpuExpert& ce = L.cpu[(size_t) e];
+            for (int p = 0; p < ce.n_parts; ++p) {
+                const PartRef& pr = ce.part[p];
+                const size_t gb = (size_t) pr.gu_rows * gu_row, db = (size_t) pr.d_rows * d_row;
+                CK(cudaMemcpyAsync(dst + (size_t) pr.gu_base * gu_row, pr.blob, gb, cudaMemcpyHostToDevice, cs_));
+                CK(cudaMemcpyAsync(dst + up_off + (size_t) pr.gu_base * gu_row, pr.blob + pr.fmt->up_off, gb,
+                                   cudaMemcpyHostToDevice, cs_));
+                CK(cudaMemcpyAsync(dst + down_off + (size_t) pr.d_base * d_row, pr.blob + pr.fmt->down_off, db,
+                                   cudaMemcpyHostToDevice, cs_));
+                pf_stream_bytes_ += (double) (2 * gb + db);
+            }
+            CK(cudaEventRecord(ev_copied_[(size_t) slot], cs_));
+        }
+    };
+    issue(RN);
+    // one expert: rows [off[e], off[e]+n) of the sorted routes -> cpu_parts_ rows of the same indices
+    auto compute = [&](int e, const uint8_t* blob, size_t uo, size_t dof) {
+        const int n = cnt[(size_t) e], o = off[(size_t) e];
+        m4k::gather_rows_f16(xn_, d_rows_ + o, n, E, X16_, s_);
+        K::dequant_f16(L.gu_type, blob, 0, F, E, (uint16_t*) W16_, s_);
+        K::dequant_f16(L.gu_type, blob + uo, 0, F, E, (uint16_t*) W16_ + (size_t) F * E, s_);
+        // GU[n][2F] = X W_gu^T
+        CB(cublasGemmEx(cb_, CUBLAS_OP_T, CUBLAS_OP_N, 2 * F, n, E, &one, W16_, CUDA_R_16F, E, X16_, CUDA_R_16F, E, &zero,
+                        GU_, CUDA_R_32F, 2 * F, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+        m4k::swiglu_f16(GU_, n, F, H16_, s_);
+        K::dequant_f16(L.d_type, blob + dof, 0, E, F, (uint16_t*) W16_, s_);
+        // D[n][E] = H W_down^T
+        CB(cublasGemmEx(cb_, CUBLAS_OP_T, CUBLAS_OP_N, E, n, F, &one, W16_, CUDA_R_16F, F, H16_, CUDA_R_16F, F, &zero,
+                        cpu_parts_ + (size_t) o * E, CUDA_R_32F, E, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+    };
+    for (int e : resident) compute(e, L.slots + (size_t) L.slot_of[(size_t) e] * L.stride, L.L.up_off, L.L.down_off);
+    for (int j = 0; j < (int) streamed.size(); ++j) {
+        const int slot = (int) ((seq0 + (uint64_t) j) % (uint64_t) RN);
+        CK(cudaStreamWaitEvent(s_, ev_copied_[(size_t) slot], 0));
+        compute(streamed[(size_t) j], ring_ + (size_t) slot * ring_stride_, up_off, down_off);
+        CK(cudaEventRecord(ev_free_[(size_t) slot], s_));
+        issue(j + 1 + RN);   // the slot just freed (in stream order) takes the next copy
+    }
+    ring_seq_ += streamed.size();
+    // combine: every route reads its sorted row (slot_of all -1, cpu_row = the sorted position)
+    m4k::moe_combine(x_, gpu_parts_, cpu_parts_, d_rpos_, sh_, d_ids_, w_, d_noslot_, T, k, E, s_);
+}
+
 // ------------------------------------------------------------------------------------------------ EAGLE draft head
 // Mistral's EAGLE head for Mistral Small 4 (vLLM: EagleMistralLarge3ForCausalLM): two DeepSeek-V2 decoder layers (MLA as
 // the model's, a dense SwiGLU FFN), fed per position p with fc([embed(token p+1) | h_p]) where h_p is the model's final
@@ -1626,17 +1848,23 @@ void Engine::load_eagle() {
     // buffers
     const size_t T = (size_t) Tm_;
     auto fa = [&](float** pp, size_t n) { CK(cudaMalloc(pp, n * 4)); bytes += n * 4; };
+    e_rows_ = std::min(Tm_, 512);   // the head runs a long chunk in pieces of this many rows (its buffers stay small)
+    const size_t ET = (size_t) e_rows_;
     fa(&mh_, T * E);
-    fa(&eemb_, T * E);
-    fa(&ecat_, T * 2 * E);
-    fa(&eg_, T * e_ff_);
-    fa(&eu_, T * e_ff_);
-    fa(&eh2_, T * e_ff_);
-    fa(&eh_, T * E);
+    fa(&eemb_, ET * E);
+    fa(&ecat_, ET * 2 * E);
+    fa(&eg_, ET * e_ff_);
+    fa(&eu_, ET * e_ff_);
+    fa(&eh2_, ET * e_ff_);
+    fa(&eh_, ET * E);
     fa(&elogits_, (size_t) hp_.n_vocab);
     fa(&d_eprob_, kMaxWin);
-    CK(cudaMalloc(&ecatq_, q8_bytes(2 * E, (int) T) + 1024));
-    CK(cudaMalloc(&ehq_, q8_bytes(e_ff_, (int) T) + 1024));
+    CK(cudaMalloc(&ecatq_, q8_bytes(2 * E, (int) ET) + 1024));
+    CK(cudaMalloc(&ehq_, q8_bytes(e_ff_, (int) ET) + 1024));
+    if (opt_.pf_gemm) {   // the prompt GEMMs' f16 scratch, sized for the head's widest products now (no growth later)
+        ensure_w16((size_t) e_ff_ * E);
+        ensure_x16(ET * (size_t) std::max(e_ff_, 2 * E));
+    }
     CK(cudaMalloc(&d_etok_, T * 4));
     CK(cudaMalloc(&d_edraft_, kMaxWin * 4));
     CK(cudaMalloc(&d_epos_, kMaxWin * 4));
@@ -1692,9 +1920,13 @@ void Engine::eagle_follow(const int32_t* next, int T, int pos0, bool rows_normed
     else m4k::rmsnorm(x_, out_norm_, mh_, E, T, E, E, hp_.eps, s_);
     for (int i = 0; i < T; ++i) petok_[i] = next[i];
     CK(cudaMemcpyAsync(d_etok_, petok_, (size_t) T * 4, cudaMemcpyHostToDevice, s_));
-    eagle_forward(d_etok_, mh_, T, pos0, d_pos_);
-    eagle_pick(eh_ + (size_t) (T - 1) * E, 0);
-    e_last_ = eh_ + (size_t) (T - 1) * E;
+    int last = 0;
+    for (int o = 0; o < T; o += e_rows_) {   // pieces of e_rows_ rows, in order (each attends to the ones before)
+        last = std::min(e_rows_, T - o);
+        eagle_forward(d_etok_ + o, mh_ + (size_t) o * E, last, pos0 + o, d_pos_ + o);
+    }
+    eagle_pick(eh_ + (size_t) (last - 1) * E, 0);
+    e_last_ = eh_ + (size_t) (last - 1) * E;
     eagle_ready_ = true;
     if (pos0 <= eagle_valid_) eagle_valid_ = std::max(eagle_valid_, pos0 + T);
 }
@@ -1928,6 +2160,7 @@ void Engine::prefill(const int32_t* toks, int T, int pos0, const GenParams* gp, 
         Layer& L = layers_[(size_t) l];
         attention(L, T, false, pos0);
         if (L.dense) ffn_dense(L, T);
+        else if (T >= opt_.pf_min && stream_ok(L)) moe_prefill_stream(l, T);
         else moe_prefill(l, T);
     }
 }
@@ -2080,6 +2313,7 @@ Engine::GenStats Engine::generate(const std::vector<int32_t>& prompt, const GenP
     eagle_ready_ = false;
     st.n_reused = reuse;
     const auto tp = Clock::now();
+    const double streamed0 = pf_stream_bytes_;
     for (int a = reuse; a < n - 1; a += opt_.chunk) {
         const int T = std::min(opt_.chunk, n - 1 - a);
         const bool win = T <= kMaxWin && !(gp.embd.is_array() && !gp.embd.empty());
@@ -2098,7 +2332,8 @@ Engine::GenStats Engine::generate(const std::vector<int32_t>& prompt, const GenP
     CK(cudaStreamSynchronize(s_));
     st.prompt_ms = ms_since(tp);
     if (opt_.mode != "serve")
-        logf_("prompt: %d tokens (%d reused) in %.0f ms", n, reuse, st.prompt_ms);
+        logf_("prompt: %d tokens (%d reused) in %.0f ms, %.1f GiB of experts streamed", n, reuse, st.prompt_ms,
+              (pf_stream_bytes_ - streamed0) / GiB);
     cached_.assign(prompt.begin(), prompt.end() - 1);
     cached_embd_key_ = gp.embd_key;
 
