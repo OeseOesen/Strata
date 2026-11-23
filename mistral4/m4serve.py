@@ -173,8 +173,8 @@ def _text_of(content) -> str:
 
 
 def normalize_messages(messages: list) -> list:
-    """What agents send, in the shape Mistral's validator accepts: every system / developer message merged into one
-    leading system message; tool call ids as 9 letters / digits (the same mapping for a call and its result); a tool
+    """What agents send, in the shape Mistral's validator accepts: the leading system / developer messages merged into
+    one system message, later ones as user turns marked [System]; tool call ids as 9 letters / digits (the same mapping for a call and its result); a tool
     result without an id gets the id of the next open call; empty assistant turns dropped; only the fields
     mistral-common reads."""
     systems, rest, open_ids = [], [], []
@@ -185,7 +185,10 @@ def normalize_messages(messages: list) -> list:
         if role in ("system", "developer"):
             t = _text_of(m.get("content"))
             if t.strip():
-                systems.append(t)
+                if rest:   # a reminder later in the chat: a user turn there (moving it up would change the prompt's
+                    rest.append({"role": "user", "content": "[System]\n" + t})   # prefix and void the KV cache)
+                else:
+                    systems.append(t)
             continue
         if role == "assistant":
             calls = []
@@ -234,7 +237,34 @@ def normalize_tools(tools):
     return out or None
 
 
+def load_default_system_prompt(spec: str, repo: str) -> str | None:
+    """Mistral's own system prompt (SYSTEM_PROMPT.txt of the model repo, as their vLLM examples load it), used when a
+    request brings none.  spec: auto (from the repo), none, or a file."""
+    if not spec or spec == "none":
+        return None
+    try:
+        if spec == "auto":
+            from huggingface_hub import hf_hub_download
+            path = hf_hub_download(repo, "SYSTEM_PROMPT.txt")
+        else:
+            path = spec
+        with open(path, encoding="utf-8") as f:
+            text = f.read()
+    except Exception as e:
+        log("no default system prompt:", e)
+        return None
+    import datetime
+    today = datetime.date.today()
+    for k, v in (("{name}", repo.split("/")[-1]), ("{today}", today.isoformat()),
+                 ("{yesterday}", (today - datetime.timedelta(days=1)).isoformat())):
+        text = text.replace(k, v)
+    log(f"default system prompt: {len(text)} characters (requests without a system message get it)")
+    return text
+
+
 class Chat:
+    default_system: str | None = None
+
     def __init__(self, tokenizer: str):
         if os.path.exists(tokenizer):
             self.mt = MistralTokenizer.from_file(tokenizer)
@@ -277,6 +307,8 @@ class Chat:
             e = str(eff).strip().lower()
             kw["reasoning_effort"] = "none" if e in ("none", "off", "minimal", "false", "0", "") else "high"
         msgs, tools = normalize_messages(messages), normalize_tools(body.get("tools"))
+        if self.default_system and not (msgs and msgs[0].get("role") == "system"):
+            msgs.insert(0, {"role": "system", "content": self.default_system})
 
         def build(ms):
             r = ChatCompletionRequest.from_openai(ms, tools=tools, **kw)
@@ -732,6 +764,9 @@ def main():
     ap.add_argument("--port", type=int, default=8080)
     ap.add_argument("--api-key", default=os.environ.get("M4_API_KEY"))
     ap.add_argument("--model-name", default="mistral-small-4")
+    ap.add_argument("--system-prompt", default="auto",
+                    help="for requests without a system message: auto (Mistral's SYSTEM_PROMPT.txt from the --tokenizer "
+                         "repo), none, or a file")
     ap.add_argument("--max-tokens", type=int, default=4096)
     ap.add_argument("--temperature", type=float, default=0.1)
     ap.add_argument("--top-p", type=float, default=1.0)
@@ -739,6 +774,8 @@ def main():
 
     S = State()
     S.chat = Chat(a.tokenizer)
+    S.chat.default_system = load_default_system_prompt(
+        a.system_prompt, a.tokenizer if not os.path.exists(a.tokenizer) else "mistralai/Mistral-Small-4-119B-2603")
     S.vision = Vision(a.vision, a.mmproj, a.model, a.vision_cpu) if a.mmproj else None
     S.engine = Engine(a.engine, a.model, shlex.split(a.engine_args))
     S.model_name, S.api_key = a.model_name, a.api_key
