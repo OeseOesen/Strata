@@ -1,6 +1,8 @@
 // engine/src/mistral4/m4_kernels.cu - see m4_kernels.cuh.
 #include "m4_kernels.cuh"
 
+#include <mma.h>
+
 #include <algorithm>
 #include <cfloat>
 #include <cmath>
@@ -248,6 +250,151 @@ __global__ void __launch_bounds__(256) mla_decode_kernel(const float* Qf, const 
             o[kLat] = m_s[oh];
             o[kLat + 1] = l_s[oh];
         }
+    }
+}
+
+// ---------------------------------------------------------------------------------------------- decode on tensor cores
+// The same work split as mla_decode_kernel (grid (kAttnChunks, T): one query token, one key range, all heads) and the
+// same partial-result layout for mla_merge_kernel, but both products on the tensor cores (WMMA 16x16x16, f16 in, f32
+// accumulate): per tile of 32 keys S[32 heads][32 keys] = Q K^T, an online softmax per head row (a warp per 4 rows,
+// a lane per key), the output O[32][256] (in shared memory, rescaled per row) += P V.  256 threads, 8 warps.
+namespace tc {
+constexpr int WT = 32;            // keys per tile
+constexpr int QLD = kKD + 8;      // halves per Q / K row in shared memory (328: 16-byte multiple, staggered banks)
+constexpr int SLD = WT + 4;       // floats per score row
+constexpr int PLD = WT + 8;       // halves per probability row
+constexpr int OLD = kLat + 4;     // floats per output row
+constexpr size_t kSmem = (size_t) kMaxHeads * QLD * 2 + (size_t) WT * QLD * 2 + (size_t) kMaxHeads * SLD * 4 +
+                         (size_t) kMaxHeads * PLD * 2 + (size_t) kMaxHeads * OLD * 4 + 3 * kMaxHeads * 4;
+}  // namespace tc
+
+__global__ void __launch_bounds__(256) mla_decode_tc_kernel(const float* Qf, const void* cache, const float* scales,
+                                                            int kv_mode, const int32_t* pos, int n_head, float kq_scale,
+                                                            float* part) {
+    using namespace nvcuda;
+    using namespace tc;
+    extern __shared__ __align__(128) unsigned char smem[];
+    __half* qh = reinterpret_cast<__half*>(smem);                       // [32][QLD]
+    __half* kh = qh + kMaxHeads * QLD;                                 // [WT][QLD]
+    float* S = reinterpret_cast<float*>(kh + WT * QLD);                // [32][SLD]
+    __half* P = reinterpret_cast<__half*>(S + kMaxHeads * SLD);        // [32][PLD]
+    float* O = reinterpret_cast<float*>(P + kMaxHeads * PLD);          // [32][OLD]
+    float* m_s = O + kMaxHeads * OLD;
+    float* l_s = m_s + kMaxHeads;
+    float* a_s = l_s + kMaxHeads;
+    const int c = blockIdx.x, t = blockIdx.y, tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+    const int n_kv = pos[t] + 1;
+    const int per = ((n_kv + kAttnChunks - 1) / kAttnChunks + WT - 1) / WT * WT;
+    const int k0 = c * per;
+    const int k1 = min(n_kv, k0 + per);
+    float* out = part + (((size_t) t * kAttnChunks + c) * n_head) * (kLat + 2);
+    if (k0 >= k1) {   // an empty range: l = 0 marks it for the merge
+        for (int i = tid; i < n_head * (kLat + 2); i += 256) {
+            const int d = i % (kLat + 2);
+            out[i] = d == kLat ? kNeg : 0.f;
+        }
+        return;
+    }
+    for (int i = tid; i < kMaxHeads * kKD; i += 256) {
+        const int h = i / kKD, d = i - h * kKD;
+        qh[h * QLD + d] = __float2half(h < n_head ? Qf[((size_t) t * n_head + h) * kKD + d] * kq_scale : 0.f);
+    }
+    for (int i = tid; i < kMaxHeads * OLD; i += 256) O[i] = 0.f;
+    if (tid < kMaxHeads) {
+        m_s[tid] = kNeg;
+        l_s[tid] = 0.f;
+        a_s[tid] = 1.f;
+    }
+    for (int kt = k0; kt < k1; kt += WT) {
+        const int nk = min(WT, k1 - kt);
+        __syncthreads();   // (a) the previous tile's readers are done
+        // 1. the key rows as f16 (4 values per item; rows beyond the range are zero)
+        for (int i = tid; i < WT * (kKD / 4); i += 256) {
+            const int r = i / (kKD / 4), w = (i - r * (kKD / 4)) * 4;
+            __half2 lo = __floats2half2_rn(0.f, 0.f), hi = lo;
+            if (r < nk) {
+                const size_t key = (size_t) (kt + r);
+                if (kv_mode == KV_F16) {
+                    const __half2* row = reinterpret_cast<const __half2*>(static_cast<const __half*>(cache) + key * kKD + w);
+                    lo = row[0];
+                    hi = row[1];
+                } else {
+                    const char4 q = *reinterpret_cast<const char4*>(static_cast<const int8_t*>(cache) + key * kKD + w);
+                    const float sc = scales[key * 2 + (w >= kLat ? 1 : 0)];
+                    lo = __floats2half2_rn((float) q.x * sc, (float) q.y * sc);
+                    hi = __floats2half2_rn((float) q.z * sc, (float) q.w * sc);
+                }
+            }
+            __half2* dst = reinterpret_cast<__half2*>(kh + r * QLD + w);
+            dst[0] = lo;
+            dst[1] = hi;
+        }
+        __syncthreads();   // (b) the tile is loaded
+        // 2. S = Q K^T: 2 x 2 fragments, warps 0-3
+        if (warp < 4) {
+            const int r = warp >> 1, cc = warp & 1;
+            wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc;
+            wmma::fill_fragment(acc, 0.f);
+            wmma::fragment<wmma::matrix_a, 16, 16, 16, __half, wmma::row_major> a;
+            wmma::fragment<wmma::matrix_b, 16, 16, 16, __half, wmma::col_major> b;
+#pragma unroll 4
+            for (int k = 0; k < kKD / 16; ++k) {
+                wmma::load_matrix_sync(a, qh + r * 16 * QLD + k * 16, QLD);
+                wmma::load_matrix_sync(b, kh + cc * 16 * QLD + k * 16, QLD);
+                wmma::mma_sync(acc, a, b, acc);
+            }
+            wmma::store_matrix_sync(S + r * 16 * SLD + cc * 16, acc, SLD, wmma::mem_row_major);
+        }
+        __syncthreads();   // (c) the scores are written
+        // 3. online softmax: warp w takes rows 4w .. 4w+3, lane = key
+#pragma unroll
+        for (int rr = 0; rr < 4; ++rr) {
+            const int row = warp * 4 + rr;
+            const float mold = m_s[row];
+            const float sv = lane < nk ? S[row * SLD + lane] : kNeg;
+            const float mx = fmaxf(mold, warp_max(sv));
+            const float pk = lane < nk ? __expf(sv - mx) : 0.f;
+            const float sum = warp_sum(pk);
+            P[row * PLD + lane] = __float2half(pk);
+            __syncwarp();
+            if (lane == 0) {
+                const float a = __expf(mold - mx);
+                l_s[row] = l_s[row] * a + sum;
+                m_s[row] = mx;
+                a_s[row] = a;
+            }
+        }
+        __syncthreads();   // (d) P and the rescale factors are written
+        for (int i = tid; i < kMaxHeads * kLat; i += 256) {
+            const int row = i / kLat, d = i - row * kLat;
+            O[row * OLD + d] *= a_s[row];
+        }
+        __syncthreads();   // (e) O is rescaled
+        // 4. O += P V: 2 x 16 fragments, 4 per warp
+#pragma unroll
+        for (int f = 0; f < 4; ++f) {
+            const int fi = warp * 4 + f, r = fi >> 4, cc = fi & 15;
+            wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc;
+            wmma::load_matrix_sync(acc, O + r * 16 * OLD + cc * 16, OLD, wmma::mem_row_major);
+            wmma::fragment<wmma::matrix_a, 16, 16, 16, __half, wmma::row_major> a;
+            wmma::fragment<wmma::matrix_b, 16, 16, 16, __half, wmma::row_major> b;
+#pragma unroll
+            for (int k = 0; k < WT / 16; ++k) {
+                wmma::load_matrix_sync(a, P + r * 16 * PLD + k * 16, PLD);
+                wmma::load_matrix_sync(b, kh + k * 16 * QLD + cc * 16, QLD);
+                wmma::mma_sync(acc, a, b, acc);
+            }
+            wmma::store_matrix_sync(O + r * 16 * OLD + cc * 16, acc, OLD, wmma::mem_row_major);
+        }
+    }
+    __syncthreads();
+    for (int i = tid; i < n_head * kLat; i += 256) {
+        const int h = i / kLat, d = i - h * kLat;
+        out[(size_t) h * (kLat + 2) + d] = O[h * OLD + d];
+    }
+    if (tid < n_head) {
+        out[(size_t) tid * (kLat + 2) + kLat] = m_s[tid];
+        out[(size_t) tid * (kLat + 2) + kLat + 1] = l_s[tid];
     }
 }
 
@@ -621,13 +768,30 @@ void mla_q_rope(const float* q, float* Qf, const float* rope_tab, const int32_t*
 size_t mla_decode_part_floats(int T, int n_head) { return (size_t) T * kAttnChunks * n_head * (kLat + 2); }
 
 void mla_attn_decode(const float* Qf, const void* cache, const float* scales, int kv_mode, const int32_t* pos, int T,
-                     int n_head, float kq_scale, float* part, float* O, cudaStream_t s) {
+                     int n_head, float kq_scale, float* part, float* O, cudaStream_t s, int impl) {
     if (n_head > kMaxHeads) {
         std::fprintf(stderr, "strata-m4: %d heads, the decode attention takes %d\n", n_head, kMaxHeads);
         std::exit(1);
     }
-    mla_decode_kernel<<<dim3(kAttnChunks, T), 256, 0, s>>>(Qf, cache, scales, kv_mode, pos, n_head, kq_scale, part);
-    check("mla_decode");
+    if (impl == ATTN_TC) {
+        static bool attr = false;   // > 48 KiB of dynamic shared memory needs the opt-in (once, before any capture)
+        if (!attr) {
+            const cudaError_t e = cudaFuncSetAttribute(mla_decode_tc_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                                       (int) tc::kSmem);
+            if (e != cudaSuccess) {
+                std::fprintf(stderr, "strata-m4: tensor-core attention needs %zu bytes of shared memory: %s\n", tc::kSmem,
+                             cudaGetErrorString(e));
+                std::exit(1);
+            }
+            attr = true;
+        }
+        mla_decode_tc_kernel<<<dim3(kAttnChunks, T), 256, tc::kSmem, s>>>(Qf, cache, scales, kv_mode, pos, n_head,
+                                                                          kq_scale, part);
+        check("mla_decode_tc");
+    } else {
+        mla_decode_kernel<<<dim3(kAttnChunks, T), 256, 0, s>>>(Qf, cache, scales, kv_mode, pos, n_head, kq_scale, part);
+        check("mla_decode");
+    }
     mla_merge_kernel<<<dim3(T, n_head), kLat, 0, s>>>(part, O, n_head);
     check("mla_merge");
 }
