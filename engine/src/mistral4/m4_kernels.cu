@@ -117,7 +117,7 @@ __global__ void mla_q_rope_kernel(const float* q, float* Qf, const float2* rope_
     const float x0 = qr[2 * pair], x1 = qr[2 * pair + 1];
     float v = (d & 1) ? (x0 * cs.y + x1 * cs.x) : (x0 * cs.x - x1 * cs.y);
     if (temp_scale != 0.f) {
-        const float sc = logf(floorf((float) (p + 1) / temp_floor) + 1.f) * temp_scale + 1.f;
+        const float sc = logf(floorf((float) p / temp_floor) + 1.f) * temp_scale + 1.f;   // llama.cpp, vLLM: offset 0
         v *= sc;
         for (int i = d; i < kLat; i += 64) o[i] *= sc;
     }

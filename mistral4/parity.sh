@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # parity.sh - is strata-m4 computing the same model as llama.cpp?  Perplexity of both on the same token ids.
 #
-#   ./parity.sh [--chunks N] [--text FILE] [--skip-llama] [--kv "f16 int8"] [--extra "strata-m4 options"]
+#   ./parity.sh [--chunks N] [--ctx 512] [--text FILE] [--skip-llama] [--kv "f16 int8"] [--extra "strata-m4 options"]
+#
+# --ctx 16384 checks long contexts: the scored second half lies beyond the original 8192 (YaRN, attention temperature).
 #
 # The text (default: llama.cpp's own docs, ~300k tokens of English prose, code and tables) is tokenized once with
 # llama.cpp's tokenizer; both engines score the second half of every 512-token chunk (llama-perplexity's method, BOS at
@@ -12,12 +14,14 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$HERE/m4.env"
 TEXT=""
 CHUNKS=10
+CTX=512
 DO_LLAMA=1
 KVS="f16 int8"
 EXTRA=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --chunks) CHUNKS="$2"; shift 2 ;;
+    --ctx) CTX="$2"; shift 2 ;;
     --text) TEXT="$2"; shift 2 ;;
     --skip-llama) DO_LLAMA=0; shift ;;
     --kv) KVS="$2"; shift 2 ;;
@@ -31,16 +35,16 @@ if [[ -z "$TEXT" ]]; then
   TEXT="$WORK/corpus.txt"
   find "$HERE/src/llama.cpp/docs" "$HERE/src/llama.cpp/tools" -name "*.md" -print0 2>/dev/null | sort -z | xargs -0 cat > "$TEXT"
 fi
-echo "text: $TEXT ($(wc -c < "$TEXT") bytes), $CHUNKS chunks of 512"
+echo "text: $TEXT ($(wc -c < "$TEXT") bytes), $CHUNKS chunks of $CTX"
 "$M4_LLAMA/llama-tokenize" -m "$M4_MODEL" -f "$TEXT" --ids 2>/dev/null | tail -n 1 | tr -d '[],' > "$WORK/ids.txt"
 # the first CHUNKS*512 ids (awk reads everything: no early-closed pipe, no SIGPIPE)
-awk -v need=$((CHUNKS * 512)) '{ for (i = 1; i <= NF && n < need; ++i) { printf "%s ", $i; ++n } } END { print "" }' \
+awk -v need=$((CHUNKS * CTX)) '{ for (i = 1; i <= NF && n < need; ++i) { printf "%s ", $i; ++n } } END { print "" }' \
   "$WORK/ids.txt" > "$WORK/ids_cut.txt"
 echo "$(wc -w < "$WORK/ids.txt") tokens in the text, $(wc -w < "$WORK/ids_cut.txt") used"
 
 if [[ $DO_LLAMA -eq 1 ]]; then
   echo "== llama.cpp llama-perplexity (-c 512, --chunks $CHUNKS)"
-  "$M4_LLAMA/llama-perplexity" -m "$M4_MODEL" -f "$TEXT" -c 512 --chunks "$CHUNKS" -ngl 99 --n-cpu-moe 24 -fa 1 \
+  "$M4_LLAMA/llama-perplexity" -m "$M4_MODEL" -f "$TEXT" -c "$CTX" --chunks "$CHUNKS" -ngl 99 --n-cpu-moe 24 -fa 1 \
     > "$WORK/llama.log" 2>&1
   echo "exit=$?"
   grep -E "Final estimate|^\[[0-9]" "$WORK/llama.log" | tail -n 3
@@ -49,7 +53,7 @@ for KV in $KVS; do
   echo "== strata-m4 --ppl (--kv $KV)"
   ARGS="$(echo " $M4_ENGINE_ARGS " | sed 's/ --kv [a-z0-9]* / /; s/ --spec [0-9]* / /; s/ --ctx [0-9]* / /')"
   # shellcheck disable=SC2086
-  "$HERE/bin/strata-m4" -m "$M4_MODEL" $ARGS --kv "$KV" --spec 0 --ctx 8192 --heat "$HERE/mistral4.m4heat" $EXTRA \
+  "$HERE/bin/strata-m4" -m "$M4_MODEL" $ARGS --kv "$KV" --spec 0 --ctx $(( CTX + 64 > 8192 ? CTX + 64 : 8192 )) --ppl-ctx "$CTX" --heat "$HERE/mistral4.m4heat" $EXTRA \
     --ppl "$WORK/ids_cut.txt" > "$WORK/m4-$KV.log" 2>&1
   echo "exit=$?"
   grep -E "^PPL|ppl chunk|error" "$WORK/m4-$KV.log" | tail -n 4

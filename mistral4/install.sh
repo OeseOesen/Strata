@@ -176,8 +176,8 @@ fi
 say "Python environment for m4serve"
 "$PREFIX/venv/bin/pip" install -q --upgrade pip
 "$PREFIX/venv/bin/pip" install -q "mistral-common[image]>=1.13" "huggingface_hub"
-cp "$HERE/m4serve.py" "$HERE/bench.sh" "$HERE/parity.sh" "$HERE/sanity.sh" "$HERE/speed.sh" "$PREFIX/"
-chmod +x "$PREFIX/bench.sh" "$PREFIX/parity.sh" "$PREFIX/sanity.sh" "$PREFIX/speed.sh"
+cp "$HERE/m4serve.py" "$HERE/bench.sh" "$HERE/parity.sh" "$HERE/sanity.sh" "$HERE/speed.sh" "$HERE/longctx.sh" "$PREFIX/"
+chmod +x "$PREFIX/bench.sh" "$PREFIX/parity.sh" "$PREFIX/sanity.sh" "$PREFIX/speed.sh" "$PREFIX/longctx.sh"
 
 say "configuration"
 ENVF="$PREFIX/m4.env"

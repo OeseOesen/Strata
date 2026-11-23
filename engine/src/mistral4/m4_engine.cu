@@ -114,13 +114,13 @@ size_t q8_bytes(int n_in, int T) { return (size_t) T * (size_t) (n_in / 32) * 36
 struct Options {
     std::string model, heat, mode = "serve", ids_file, dump_ids, dump_layers = "0,1";
     int ctx = 65536, chunk = 512, spec = 6, kv = m4k::KV_I8, workers = -1, host_core = -1, bench_pp = 512,
-        bench_tg = 128, ngram_mib = 1024, seed = 0, gpu = 0;
+        bench_tg = 128, ngram_mib = 1024, seed = 0, gpu = 0, ppl_ctx = 512;
     double vram_reserve = 1.5, vram_experts = -1, ram_gpu_node = -1, ram_other_node = -1;
     std::string eagle;            // EAGLE draft head: Mistral's consolidated.safetensors (or its folder)
     int eagle_k = 3;              // drafts per window at most (Mistral recommends 3)
     double eagle_p = 0.3;         // stop drafting when the chain's probability (product of the steps') falls below
     std::string numa = "split";   // measured on the R740 (2x Gold 6154): split 42.6 tok/s decode vs tiered 35.3
-    bool graph = true, keep_file_tier = true, attn_gemm = false;
+    bool graph = true, keep_file_tier = true, attn_gemm = false, attn_temp = true;
 };
 
 void usage() {
@@ -132,6 +132,8 @@ void usage() {
                  "  --ppl IDS.txt            perplexity over token ids (whitespace separated), chunks of --chunk\n"
                  "  --dump 1,2,3             debug: run these token ids as one prompt and print every intermediate of the\n"
                  "                           --dump-layers (default 0,1) in llama-eval-callback's names, then the top logits\n"
+                 "  --ppl-ctx N              perplexity chunk length (default 512; the second half of each chunk is scored)\n"
+                 "  --no-attn-temp           debug: ignore the GGUF's attention temperature scaling (llama-4 style, > 8k)\n"
                  "  --ctx N                  context (default 65536; the int8 latent cache costs 11.5 KiB per token)\n"
                  "  --kv int8|f16            latent cache format (default int8)\n"
                  "  --chunk N                prompt chunk (default 512)\n"
@@ -173,6 +175,8 @@ Options parse(int argc, char** argv) {
         else if (a == "--serve") o.mode = "serve";
         else if (a == "--bench") o.mode = "bench";
         else if (a == "--ppl") { o.mode = "ppl"; o.ids_file = next(); }
+        else if (a == "--ppl-ctx") o.ppl_ctx = std::stoi(next());
+        else if (a == "--no-attn-temp") o.attn_temp = false;
         else if (a == "--dump") { o.mode = "dump"; o.dump_ids = next(); }
         else if (a == "--dump-layers") o.dump_layers = next();
         else if (a == "--ctx") o.ctx = std::stoi(next());
@@ -597,6 +601,7 @@ void Engine::read_hparams() {
     hp_.temp_scale = (float) num("attention.temperature_scale", 0.0);
     hp_.temp_floor = (float) num("attention.temperature_length", 0.0);
     if (hp_.temp_scale != 0.f && hp_.temp_floor <= 0.f) hp_.temp_floor = 8192.f;
+    if (!opt_.attn_temp) hp_.temp_scale = 0.f;
     const strata::MetaValue* toks = m.get("tokenizer.ggml.tokens");
     if (const strata::MetaValue* b = m.get("tokenizer.ggml.bos_token_id")) bos_ = (int) b->num();
     hp_.n_vocab = (int) num("vocab_size", toks ? (double) toks->count : 0.0);
@@ -634,9 +639,9 @@ void Engine::read_hparams() {
     const float mscale = attn_factor_org * (1.f + 0.1f * log_mul * logf(1.f / hp_.freq_scale));
     hp_.kq_scale = mscale * mscale / sqrtf((float) (hp_.nope + hp_.rope));
     logf_("%s: %d layers, %d embd, %d heads, q_lora %d, kv_lora %d, %d experts top-%d (ff %d, shared %d), vocab %d, "
-          "yarn x%.0f (orig %d), kq_scale %.5f, router %s%s scale %.3f",
+          "yarn x%.0f (orig %d), kq_scale %.5f, attention temperature %.3f / %.0f, router %s%s scale %.3f",
           arch.c_str(), hp_.n_layer, hp_.n_embd, hp_.n_head, hp_.q_lora, hp_.kv_lora, hp_.n_expert, hp_.top_k, hp_.n_ff,
-          hp_.n_shexp, hp_.n_vocab, 1.f / hp_.freq_scale, hp_.n_ctx_orig, hp_.kq_scale,
+          hp_.n_shexp, hp_.n_vocab, 1.f / hp_.freq_scale, hp_.n_ctx_orig, hp_.kq_scale, hp_.temp_scale, hp_.temp_floor,
           hp_.gating == 2 ? "sigmoid" : "softmax", hp_.w_norm ? " norm" : "", hp_.w_scale);
 }
 
@@ -1509,6 +1514,7 @@ void Engine::load_eagle() {
             logf_("EAGLE: no params.json next to %s, shapes from the tensors", path.c_str());
         }
     }
+    if (!opt_.attn_temp) e_temp_ = 0.f;
     if (std::fabs(eps - hp_.eps) > 1e-9) logf_("EAGLE: norm eps %g differs from the model's %g (the model's is used)", eps, hp_.eps);
     if (hp_.q_lora <= 0) fail("EAGLE: the model has no q_lora (the head needs the MLA q path)");
     Safetensors st;
@@ -2470,8 +2476,9 @@ int run(int argc, char** argv) {
         std::ifstream f(o.ids_file);
         std::vector<int32_t> ids;
         for (int32_t v; f >> v;) ids.push_back(v);
-        const int chunk = 512;
-        logf_("perplexity over %zu tokens", ids.size());
+        const int chunk = o.ppl_ctx;
+        if (chunk + kMaxWin > o.ctx) fail("--ppl-ctx needs --ctx >= ppl-ctx + 16");
+        logf_("perplexity over %zu tokens, chunks of %d", ids.size(), chunk);
         const double p = eng.perplexity(ids, chunk);
         std::printf("PPL %.4f\n", p);
         eng.save_heat();
