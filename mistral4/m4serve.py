@@ -9,13 +9,16 @@ Prompts are built by mistral-common (Mistral's own reference for the chat format
 [THINK] reasoning with reasoning_effort, images); the engine only sees token ids.  Answers are split back into
 content, reasoning_content and tool_calls.
 
-Endpoints: GET /health, GET /v1/models, POST /v1/chat/completions (stream or not), POST /v1/completions.
+Endpoints: GET /health, GET /v1/models, POST /v1/chat/completions (stream or not), POST /v1/completions,
+GET /v1/telemetry and /v1/status (Strata's read-only telemetry contract, schema 1: `strata monitor --url http://host:port`
+shows this server like a Strata server; run it on port 8095 and the monitor needs no --url).
 One request runs at a time (the engine keeps one prompt cache); others wait in line.
 """
 from __future__ import annotations
 
 import argparse
 import base64
+import collections
 import hashlib
 import json
 import os
@@ -234,6 +237,177 @@ class Chat:
         return dec(rest), dec(reasoning), calls
 
 
+# ---------------------------------------------------------------------------------------------- telemetry
+class Telemetry:
+    """What `strata monitor` reads (GET /v1/telemetry, schema 1; see terminal/strata_cli/client.py sanitize_telemetry):
+    the one slot, the queue, request transitions, rates, the GPU (nvidia-smi) and the host's RAM.  Memory in bytes."""
+
+    GPU_FIELDS = ("index", "name", "memory.used", "memory.total", "utilization.gpu", "temperature.gpu", "power.draw",
+                  "power.limit", "pcie.link.gen.current", "pcie.link.gen.max", "pcie.link.width.current",
+                  "pcie.link.width.max")
+
+    def __init__(self, model_id: str):
+        self.lock = threading.Lock()
+        self.instance = uuid.uuid4().hex[:16]
+        self.boot = time.time()
+        self.model_id = model_id
+        self.context = None
+        self.seq = 0
+        self.events = collections.deque(maxlen=64)
+        self.queue: dict[str, dict] = {}          # waiting requests, in order
+        self.cur: dict | None = None              # the request on the engine
+        self.recent = collections.deque(maxlen=50)
+        self.totals = {"since": self.boot, "requests": 0, "prompt_tokens": 0, "output_tokens": 0}
+        self.last_answer = None
+        self.last_prefill = None
+        self.devices: list[dict] = []
+        threading.Thread(target=self._sample_gpus, daemon=True).start()
+
+    # -- request transitions
+    def _event(self, rid: str, event: str, outcome: str | None = None):
+        self.seq += 1
+        self.events.append({"seq": self.seq, "at": time.time(), "request_id": rid, "event": event, "outcome": outcome})
+
+    def queued(self, prompt_tokens: int) -> str:
+        rid = uuid.uuid4().hex[:12]
+        with self.lock:
+            self.queue[rid] = {"id": rid, "state": "queued", "queued_at": time.time(), "admitted_at": None,
+                               "prompt_tokens": prompt_tokens}
+            self._event(rid, "queued")
+        return rid
+
+    def admitted(self, rid: str):
+        with self.lock:
+            row = self.queue.pop(rid, None) or {"id": rid, "queued_at": time.time(), "prompt_tokens": None}
+            now = time.time()
+            self.cur = {**row, "state": "reading", "admitted_at": now, "generated": 0, "first_at": None}
+            self._event(rid, "admitted")
+            self._event(rid, "reading")
+
+    def tokens(self, n: int):
+        with self.lock:
+            c = self.cur
+            if c is None:
+                return
+            if c["first_at"] is None:
+                c["first_at"] = time.time()
+                c["state"] = "decoding"
+                self._event(c["id"], "first_token")
+            c["generated"] += n
+
+    def finished(self, rid: str, st: dict | None, outcome: str):
+        with self.lock:
+            self.queue.pop(rid, None)
+            c = self.cur if self.cur and self.cur["id"] == rid else None
+            now = time.time()
+            st = st or {}
+            event = {"stop": "finished", "length": "finished", "cancel": "cancelled", "disconnect": "disconnected"}.get(outcome, "error")
+            self._event(rid, event, outcome)
+            if c is not None:
+                n_prompt, n_gen = int(st.get("n_prompt", c.get("prompt_tokens") or 0)), int(st.get("n_gen", c["generated"]))
+                pms, gms = float(st.get("prompt_ms", 0) or 0), float(st.get("gen_ms", 0) or 0)
+                self.recent.appendleft({"id": rid, "time": now, "duration_s": round(now - c["admitted_at"], 3), "finish": outcome,
+                                        "prompt_tokens": n_prompt, "reused": int(st.get("n_reused", 0)), "output_tokens": n_gen,
+                                        "prompt_ms": round(pms, 1), "decode_ms": round(gms, 1),
+                                        "first_engine_token_s": round(c["first_at"] - c["admitted_at"], 3) if c["first_at"] else None})
+                self.totals["requests"] += 1
+                self.totals["prompt_tokens"] += n_prompt
+                self.totals["output_tokens"] += n_gen
+                if gms > 0 and n_gen > 1:
+                    self.last_answer = (n_gen / (gms / 1000.0), gms / 1000.0)
+                read = n_prompt - int(st.get("n_reused", 0))
+                if pms > 0 and read > 16:
+                    self.last_prefill = read / (pms / 1000.0)
+                self.cur = None
+
+    # -- hardware
+    def _sample_gpus(self):
+        while True:
+            try:
+                out = subprocess.run(["nvidia-smi", "--query-gpu=" + ",".join(self.GPU_FIELDS), "--format=csv,noheader,nounits"],
+                                     capture_output=True, text=True, timeout=5).stdout
+                rows = []
+                for line in out.strip().splitlines()[:16]:
+                    f = [x.strip() for x in line.split(",")]
+                    if len(f) != len(self.GPU_FIELDS):
+                        continue
+                    num = lambda x: (float(x) if "." in x else int(x)) if x.replace(".", "", 1).isdigit() else None
+                    mib = lambda x: int(float(x) * 2**20) if num(x) is not None else None
+                    rows.append({"index": num(f[0]), "name": f[1], "mem_used": mib(f[2]), "mem_total": mib(f[3]),
+                                 "util": num(f[4]), "temp": num(f[5]), "power": num(f[6]), "power_limit": num(f[7]),
+                                 "pcie_gen": num(f[8]), "pcie_gen_max": num(f[9]), "pcie_width": num(f[10]),
+                                 "pcie_width_max": num(f[11])})
+                with self.lock:
+                    self.devices = rows
+            except Exception:
+                pass
+            time.sleep(1.0)
+
+    @staticmethod
+    def _ram():
+        try:
+            m = {}
+            with open("/proc/meminfo") as f:
+                for line in f:
+                    k, v = line.split(":", 1)
+                    m[k] = int(v.split()[0]) * 1024
+            return {"used": m["MemTotal"] - m.get("MemAvailable", m.get("MemFree", 0)), "total": m["MemTotal"]}
+        except Exception:
+            return {"used": None, "total": None}
+
+    # -- the snapshot
+    def snapshot(self) -> dict:
+        now = time.time()
+        with self.lock:
+            c = dict(self.cur) if self.cur else None
+            queue = [dict(r) for r in self.queue.values()]
+            if c:
+                live_rate = (c["generated"] / (now - c["first_at"])) if c["first_at"] and now > c["first_at"] and c["generated"] > 1 else None
+                slot = {"slot": 0, "group": None, "replica": None, "request_id": c["id"], "state": c["state"],
+                        "held_tokens": None, "prompt_tokens": c.get("prompt_tokens"),
+                        "prompt_read": c.get("prompt_tokens") if c["first_at"] else None, "generated": c["generated"],
+                        "elapsed_s": round(now - c["admitted_at"], 2), "tok_s": round(live_rate, 1) if live_rate else None}
+            else:
+                live_rate = None
+                slot = {"slot": 0, "state": "idle", "held_tokens": None}
+            requests = [{"id": r["id"], "state": "queued", "queued_at": r["queued_at"], "admitted_at": None, "slot": None,
+                         "group": None, "replica": None, "prompt_tokens": r.get("prompt_tokens"), "prompt_read": None,
+                         "generated": None, "first_engine_token_s": None} for r in queue]
+            if c:
+                requests.insert(0, {"id": c["id"], "state": c["state"], "queued_at": c["queued_at"], "admitted_at": c["admitted_at"],
+                                    "slot": 0, "group": None, "replica": None, "prompt_tokens": c.get("prompt_tokens"),
+                                    "prompt_read": slot["prompt_read"], "generated": c["generated"],
+                                    "first_engine_token_s": round(c["first_at"] - c["admitted_at"], 3) if c["first_at"] else None})
+            answer = (live_rate, None) if live_rate else (self.last_answer or (None, None))
+            return {
+                "schema_version": 1, "source": "m4serve", "sampled_at": now,
+                "instance": {"id": self.instance, "boot_time": self.boot, "server": "m4serve (strata-m4)", "state": "ready"},
+                "model": {"id": self.model_id, "loaded": True, "context": self.context},
+                "work": {"slots_requested": 1, "slots_effective": 1, "active": 1 if c else 0, "queued": len(queue),
+                         "waiting": len(queue), "outside_slots": 0, "groups": None, "requests_omitted": 0,
+                         "oldest_queue_s": round(max((now - r["queued_at"] for r in queue), default=0), 2),
+                         "slots": [slot], "requests": requests[:50]},
+                "rates": {"answer_tok_s": round(answer[0], 1) if answer[0] else None,
+                          "answer_window_s": round(answer[1], 2) if answer[1] else None,
+                          "prefill_tok_s": round(self.last_prefill, 1) if self.last_prefill else None,
+                          "output_tokens_server_counter": self.totals["output_tokens"] + (c["generated"] if c else 0)},
+                "topology": {"mode": "single", "selected_devices": [d["index"] for d in self.devices if d.get("index") is not None][:1],
+                             "stages": [], "source": "m4serve"},
+                "devices": list(self.devices),
+                "ram": self._ram(),
+                "recent": list(self.recent),
+                "totals": dict(self.totals),
+                "activity": {"last_seq": self.seq, "events": list(self.events)[-32:]},
+                "quality": {"request_correlation": "reported", "per_device": "reported"},
+            }
+
+    def status(self) -> dict:
+        with self.lock:
+            busy = self.cur is not None
+        return {"service": "m4serve (strata-m4)", "model": self.model_id, "loaded": True, "started": self.boot,
+                "cache_max_tokens": self.context, "busy": busy, "concurrency": {"serving": 1}}
+
+
 # ---------------------------------------------------------------------------------------------- HTTP
 class State:
     engine: Engine
@@ -242,10 +416,30 @@ class State:
     model_name: str
     api_key: str | None
     defaults: dict
+    tele: Telemetry
 
 
 def make_handler(S: State):
     gate = threading.Lock()
+
+    def run(req: dict, on_tokens, cancelled) -> dict:
+        """One engine request behind the line, with its telemetry transitions."""
+        rid = S.tele.queued(len(req.get("ids") or []))
+        st, outcome = None, "error"
+        try:
+            with gate:
+                S.tele.admitted(rid)
+
+                def tok(ids_):
+                    S.tele.tokens(len(ids_))
+                    on_tokens(ids_)
+                st = S.engine.generate(req, tok, cancelled)
+            fin = st.get("finish")
+            outcome = "stop" if fin == "stop" else "length" if fin in ("length", "context") else \
+                "disconnect" if cancelled() else "cancel" if fin == "abort" else "error"
+            return st
+        finally:
+            S.tele.finished(rid, st, outcome)
 
     class H(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
@@ -274,6 +468,10 @@ def make_handler(S: State):
                 return self._json(200, {"status": "ok", "engine": S.engine.info})
             if not self._auth():
                 return
+            if self.path == "/v1/telemetry":
+                return self._json(200, S.tele.snapshot())
+            if self.path == "/v1/status":
+                return self._json(200, S.tele.status())
             if self.path == "/v1/models":
                 return self._json(200, {"object": "list", "data": [{"id": S.model_name, "object": "model", "owned_by": "local"}]})
             self._json(404, {"error": {"message": "not found"}})
@@ -316,8 +514,7 @@ def make_handler(S: State):
             created = int(time.time())
             out: list[int] = []
             if not stream:
-                with gate:
-                    st = S.engine.generate(req, out.extend, lambda: False)
+                st = run(req, out.extend, lambda: False)
                 content, reasoning, calls = S.chat.split([t for t in out if t != S.chat.eos])
                 msg = {"role": "assistant", "content": content or (None if calls else "")}
                 if reasoning:
@@ -368,8 +565,7 @@ def make_handler(S: State):
                     chunk({"content": content[len(sent["content"]):]})
                     sent["content"] = content
 
-            with gate:
-                st = S.engine.generate(req, on_tokens, lambda: gone[0])
+            st = run(req, on_tokens, lambda: gone[0])
             content, reasoning, calls = S.chat.split([t for t in out if t != S.chat.eos])
             if content.startswith(sent["content"]) and len(content) > len(sent["content"]):
                 chunk({"content": content[len(sent["content"]):]})
@@ -393,8 +589,7 @@ def make_handler(S: State):
                 ids = S.chat.tok.encode(str(prompt), bos=True, eos=False)
             req = self._gen_req(body, ids, None, "")
             out: list[int] = []
-            with gate:
-                st = S.engine.generate(req, out.extend, lambda: False)
+            st = run(req, out.extend, lambda: False)
             text = S.chat.tok.decode([t for t in out if t != S.chat.eos], special_token_policy=SpecialTokenPolicy.IGNORE)
             self._json(200, {"id": "cmpl-" + uuid.uuid4().hex[:24], "object": "text_completion", "created": int(time.time()),
                              "model": S.model_name, "choices": [{"index": 0, "text": text,
@@ -429,6 +624,8 @@ def main():
     S.vision = Vision(a.vision, a.mmproj, a.model, a.vision_cpu) if a.mmproj else None
     S.engine = Engine(a.engine, a.model, shlex.split(a.engine_args))
     S.model_name, S.api_key = a.model_name, a.api_key
+    S.tele = Telemetry(a.model_name + " (" + os.path.basename(a.model) + ")")
+    S.tele.context = S.engine.info.get("ctx")
     S.defaults = {"max_tokens": a.max_tokens, "temperature": a.temperature, "top_p": a.top_p}
     srv = ThreadingHTTPServer((a.host, a.port), make_handler(S))
     log(f"listening on http://{a.host}:{a.port}/v1 (model name '{a.model_name}')")
