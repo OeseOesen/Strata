@@ -654,7 +654,10 @@ def make_handler(S: State):
             if self.path == "/v1/status":
                 return self._json(200, S.tele.status())
             if self.path == "/v1/models":
-                return self._json(200, {"object": "list", "data": [{"id": S.model_name, "object": "model", "owned_by": "local"}]})
+                ctx = S.engine.info.get("ctx")
+                return self._json(200, {"object": "list", "data": [{"id": S.model_name, "object": "model", "owned_by": "local",
+                                                                    "max_model_len": ctx, "context_length": ctx,
+                                                                    "context_window": ctx}]})
             self._json(404, {"error": {"message": "not found"}})
 
         def do_POST(self):
@@ -671,6 +674,18 @@ def make_handler(S: State):
                 return self._completion(body)
             log(f"404: POST {self.path} (this server speaks /v1/chat/completions and /v1/completions)")
             self._json(404, {"error": {"message": f"not found: {self.path}; use /v1/chat/completions"}})
+
+        def _too_long(self, n: int) -> bool:
+            """A prompt that does not fit the engine's context is refused the way OpenAI does it (agents read the code
+            and compact their history) - never answered with an empty 'length'."""
+            ctx = int(S.engine.info.get("ctx") or 0)
+            if ctx and n + 32 >= ctx:
+                log(f"400: prompt of {n} tokens, context {ctx}")
+                self._json(400, {"error": {"message": f"This model's maximum context length is {ctx} tokens. However, your "
+                                                      f"messages resulted in {n} tokens. Please reduce the length of the messages.",
+                                           "type": "invalid_request_error", "param": "messages", "code": "context_length_exceeded"}})
+                return True
+            return False
 
         # -- the engine request
         def _gen_req(self, body: dict, ids: list[int], embd, key: str) -> dict:
@@ -691,6 +706,8 @@ def make_handler(S: State):
             except Exception as e:
                 log(f"400 on /v1/chat/completions: {type(e).__name__}: {e}")
                 return self._json(400, {"error": {"message": f"{type(e).__name__}: {e}", "type": "invalid_request_error"}})
+            if self._too_long(len(ids)):
+                return
             req = self._gen_req(body, ids, embd, key)
             stream = bool(body.get("stream"))
             rid = "chatcmpl-" + uuid.uuid4().hex[:24]
@@ -770,6 +787,8 @@ def make_handler(S: State):
                 ids = prompt
             else:
                 ids = S.chat.tok.encode(str(prompt), bos=True, eos=False)
+            if self._too_long(len(ids)):
+                return
             req = self._gen_req(body, ids, None, "")
             out: list[int] = []
             st = run(req, out.extend, lambda: False)
