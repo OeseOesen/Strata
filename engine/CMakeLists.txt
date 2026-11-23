@@ -938,3 +938,18 @@ if(STRATA_BUILD_TESTS)
 else()
   message(STATUS "strata tests: OFF (STRATA_BUILD_TESTS=OFF)")
 endif()
+
+# strata-m4: Mistral Small 4 (GGUF architecture mistral4) on one GPU plus a NUMA host (src/mistral4, docs/MISTRAL4.md).
+# Volta (sm_70) and newer; CUDA only.  Built from Strata's quantized kernels (strata_kernels, strata_kernels_cpu).
+option(STRATA_BUILD_M4 "Build strata-m4: the Mistral Small 4 hybrid GPU + NUMA engine" ON)
+if(STRATA_ENABLE_CUDA AND STRATA_BUILD_M4 AND NOT STRATA_ENABLE_HIP AND NOT STRATA_HIP_GFX906)
+  find_package(Threads REQUIRED)
+  add_executable(strata-m4 src/mistral4/m4_main.cpp src/mistral4/m4_engine.cu src/mistral4/m4_kernels.cu
+                           src/mistral4/m4_numa.cpp)
+  target_include_directories(strata-m4 PRIVATE include src/mistral4 third_party/strata-llama/vendor
+                                               ${_strata_gpu_include_directories})
+  target_link_libraries(strata-m4 PRIVATE strata_kernels strata_kernels_cpu strata_artifact ${_strata_gpu_blas_target}
+                                          ${_strata_gpu_runtime_target} Threads::Threads)
+  target_compile_options(strata-m4 PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--use_fast_math -lineinfo>)
+  set_target_properties(strata-m4 PROPERTIES CUDA_SEPARABLE_COMPILATION OFF)
+endif()

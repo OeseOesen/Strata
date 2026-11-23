@@ -60,6 +60,9 @@ constexpr size_t kNvfp4Tail = 16;
 
 /// Whether this build has the ggml-cpu path.
 bool native_experts_available() noexcept;
+/// strata-m4: let native_fmt accept layers whose activations exceed kNativeActBytes / kNativeHBytes (a caller that
+/// sizes its own buffers from f.act_bytes / f.h_bytes, never Strata's ExpertPool).  Off by default.
+void native_fmt_allow_large(bool allow);
 /// Fills `f` for a layer; false (with a reason) when ggml-cpu has no dot product for a type.
 bool native_fmt(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, NativeFmt& f, std::string& err);
 
