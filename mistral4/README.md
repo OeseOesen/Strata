@@ -89,6 +89,8 @@ Wichtige Engine-Optionen (`strata-m4 --help`):
 | `--vram-reserve`, `--vram-experts` | VRAM-Reserve und Obergrenze für Expertenslots |
 | `--workers N`, `--host-core N` | Worker pro Node; der Kern des GPU-fütternden Host-Threads |
 | `--ngram-mib N` | globale n-Gramm-Tabelle auf dem anderen Node |
+| `--attn tc\|kernel\|gemm` | Decode-Attention: Tensor-Kerne (Standard), CUDA-Kerne, cuBLAS |
+| `--attn-temp-scale X` | Attention-Temperatur ab 8192 Tokens erzwingen (Mistral: 0,1; die unsloth-GGUF hat keine) |
 | `--eagle PFAD` | Eagle-Kopf (Ordner mit `consolidated.safetensors` und `params.json`) |
 | `--eagle-k N`, `--eagle-p P` | Eagle: höchstens N Entwürfe pro Fenster; Abbruch, wenn die Kettenwahrscheinlichkeit unter P fällt |
 

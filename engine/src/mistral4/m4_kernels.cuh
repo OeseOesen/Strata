@@ -44,8 +44,11 @@ void mla_q_rope(const float* q, float* Qf, const float* rope_tab, const int32_t*
 /// cache rows k <= pos[t].  Split over kAttnChunks key ranges and merged; `part` is scratch of
 /// mla_decode_part_floats(T, n_head) floats.
 size_t mla_decode_part_floats(int T, int n_head);
+/// impl: ATTN_TC (default) both products on the tensor cores (WMMA, f16 in, f32 accumulate; needs sm_70+), ATTN_SIMT
+/// the plain CUDA-core kernel.
+enum AttnImpl : int { ATTN_SIMT = 0, ATTN_TC = 1 };
 void mla_attn_decode(const float* Qf, const void* cache, const float* scales, int kv_mode, const int32_t* pos, int T,
-                     int n_head, float kq_scale, float* part, float* O, cudaStream_t s);
+                     int n_head, float kq_scale, float* part, float* O, cudaStream_t s, int impl = ATTN_TC);
 /// Prompt path helpers (cuBLAS does the products): the cache rows [0, n) as f16 K rows (ld 320), Qf as f16 scaled by
 /// `scale`, the causal softmax over scores S (column c = token c / n_head; keys <= pos[t]) into f16 P.
 void mla_cache_to_f16(const void* cache, const float* scales, int kv_mode, int n, __half* K16, cudaStream_t s);

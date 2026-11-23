@@ -114,7 +114,8 @@ size_t q8_bytes(int n_in, int T) { return (size_t) T * (size_t) (n_in / 32) * 36
 struct Options {
     std::string model, heat, mode = "serve", ids_file, dump_ids, dump_layers = "0,1";
     int ctx = 65536, chunk = 512, spec = 6, kv = m4k::KV_I8, workers = -1, host_core = -1, bench_pp = 512,
-        bench_tg = 128, ngram_mib = 1024, seed = 0, gpu = 0, ppl_ctx = 512;
+        bench_tg = 128, ngram_mib = 1024, seed = 0, gpu = 0, ppl_ctx = 512, attn_impl = m4k::ATTN_TC;
+    double attn_temp_scale = -1;   // < 0: the GGUF's
     double vram_reserve = 1.5, vram_experts = -1, ram_gpu_node = -1, ram_other_node = -1;
     std::string eagle;            // EAGLE draft head: Mistral's consolidated.safetensors (or its folder)
     int eagle_k = 3;              // drafts per window at most (Mistral recommends 3)
@@ -153,8 +154,10 @@ void usage() {
                  "  --eagle-acc IDS.txt      debug: teacher-forced top-1 accuracy of the model and of the EAGLE head\n"
                  "  --ngram-mib N            global n-gram table on the other node (default 1024, 0 = off)\n"
                  "  --no-graph               launch decode windows eagerly (debugging)\n"
-                 "  --attn kernel|gemm       decode attention: the split-K kernel (default) or the prompt path's cuBLAS route\n"
-                 "                           (no CUDA graphs then)\n"
+                 "  --attn tc|kernel|gemm    decode attention: split-K on the tensor cores (default), split-K on the CUDA cores,\n"
+                 "                           or the prompt path's cuBLAS route (no CUDA graphs then)\n"
+                 "  --attn-temp-scale X      override the GGUF's llama-4 attention temperature (beta; 0.1 from 8192 on is what\n"
+                 "                           Mistral's own params.json says; the unsloth GGUF carries none)\n"
                  "  --selftest-attn          check the attention kernels against a CPU reference on random data (no model)\n"
                  "  --gpu N                  CUDA device (default 0)\n");
 }
@@ -193,7 +196,13 @@ Options parse(int argc, char** argv) {
         else if (a == "--heat") o.heat = next();
         else if (a == "--ngram-mib") o.ngram_mib = std::stoi(next());
         else if (a == "--no-graph") o.graph = false;
-        else if (a == "--attn") { const std::string v = next(); o.attn_gemm = v == "gemm"; }
+        else if (a == "--attn") {
+            const std::string v = next();
+            if (v != "gemm" && v != "tc" && v != "kernel") fail("--attn tc|kernel|gemm");
+            o.attn_gemm = v == "gemm";
+            o.attn_impl = v == "kernel" ? m4k::ATTN_SIMT : m4k::ATTN_TC;
+        }
+        else if (a == "--attn-temp-scale") o.attn_temp_scale = std::stod(next());
         else if (a == "--selftest-attn") o.mode = "selftest-attn";
         else if (a == "--bench-pp") o.bench_pp = std::stoi(next());
         else if (a == "--bench-tg") o.bench_tg = std::stoi(next());
@@ -601,6 +610,10 @@ void Engine::read_hparams() {
     hp_.temp_scale = (float) num("attention.temperature_scale", 0.0);
     hp_.temp_floor = (float) num("attention.temperature_length", 0.0);
     if (hp_.temp_scale != 0.f && hp_.temp_floor <= 0.f) hp_.temp_floor = 8192.f;
+    if (opt_.attn_temp_scale >= 0) {
+        hp_.temp_scale = (float) opt_.attn_temp_scale;
+        if (hp_.temp_floor <= 0.f) hp_.temp_floor = 8192.f;
+    }
     if (!opt_.attn_temp) hp_.temp_scale = 0.f;
     const strata::MetaValue* toks = m.get("tokenizer.ggml.tokens");
     if (const strata::MetaValue* b = m.get("tokenizer.ggml.bos_token_id")) bos_ = (int) b->num();
@@ -1288,7 +1301,7 @@ void Engine::attention(Layer& L, int T, bool window, int pos0, const int32_t* po
     m4k::mla_q_rope(q_, Qf_, rope_, P, T, H, ts, tf, s_);
     dbg("Qcur[absorbed|q_pe]", li, Qf_, T * H, m4k::kKD);
     if (window && !opt_.attn_gemm) {
-        m4k::mla_attn_decode(Qf_, L.kv, L.kv_s, opt_.kv, P, T, H, hp_.kq_scale, part_, Olat_, s_);
+        m4k::mla_attn_decode(Qf_, L.kv, L.kv_s, opt_.kv, P, T, H, hp_.kq_scale, part_, Olat_, s_, opt_.attn_impl);
     } else {
         // prompt chunk at positions pos0 .. pos0+T-1: K rows 0 .. pos0+T-1 as f16, S = K^T Q, causal softmax, O = V P
         const int n_kv = pos0 + T;
@@ -2395,7 +2408,7 @@ int selftest_attn(int gpu) {
                     }
                 // device data
                 void* cache = nullptr;
-                float *scl = nullptr, *dQ = nullptr, *part = nullptr, *O = nullptr, *O2 = nullptr, *S = nullptr;
+                float *scl = nullptr, *dQ = nullptr, *part = nullptr, *O = nullptr, *O2 = nullptr, *O3 = nullptr, *S = nullptr;
                 int32_t* dpos = nullptr;
                 __half *K16 = nullptr, *Q16 = nullptr, *P = nullptr;
                 const size_t cb_bytes = (size_t) n_kv * D * (kv_mode == m4k::KV_F16 ? 2 : 1);
@@ -2413,7 +2426,10 @@ int selftest_attn(int gpu) {
                 CK(cudaMemset(part, 0x7f, m4k::mla_decode_part_floats(T, H) * 4));   // poison: stale data shows
                 CK(cudaMalloc(&O, (size_t) T * H * LAT * 4));
                 CK(cudaMalloc(&O2, (size_t) T * H * LAT * 4));
-                m4k::mla_attn_decode(dQ, cache, scl, kv_mode, dpos, T, H, scale, part, O, s);
+                CK(cudaMalloc(&O3, (size_t) T * H * LAT * 4));
+                m4k::mla_attn_decode(dQ, cache, scl, kv_mode, dpos, T, H, scale, part, O, s, m4k::ATTN_SIMT);
+                CK(cudaMemset(part, 0x7f, m4k::mla_decode_part_floats(T, H) * 4));
+                m4k::mla_attn_decode(dQ, cache, scl, kv_mode, dpos, T, H, scale, part, O3, s, m4k::ATTN_TC);
                 // the cuBLAS route (as attention() runs it for prompts)
                 CK(cudaMalloc(&K16, (size_t) n_kv * D * 2));
                 CK(cudaMalloc(&Q16, Q.size() * 2));
@@ -2429,27 +2445,83 @@ int selftest_attn(int gpu) {
                 CB(cublasGemmEx(cb, CUBLAS_OP_N, CUBLAS_OP_N, LAT, cols, m, &one, K16, CUDA_R_16F, D, P, CUDA_R_16F, m, &zero, O2,
                                 CUDA_R_32F, LAT, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
                 CK(cudaStreamSynchronize(s));
-                std::vector<float> o((size_t) T * H * LAT), o2(o.size());
+                std::vector<float> o((size_t) T * H * LAT), o2(o.size()), o3(o.size());
                 CK(cudaMemcpy(o.data(), O, o.size() * 4, cudaMemcpyDeviceToHost));
                 CK(cudaMemcpy(o2.data(), O2, o2.size() * 4, cudaMemcpyDeviceToHost));
-                double e1 = 0, e2 = 0, mag = 0;
+                CK(cudaMemcpy(o3.data(), O3, o3.size() * 4, cudaMemcpyDeviceToHost));
+                double e1 = 0, e2 = 0, e3 = 0, mag = 0;
                 int wt = -1, wh = -1;
                 for (size_t i = 0; i < o.size(); ++i) {
                     mag = std::max(mag, std::fabs(ref[i]));
                     const double d1 = std::fabs(o[i] - ref[i]);
                     if (!(d1 <= e1)) { e1 = d1; wt = (int) (i / ((size_t) H * LAT)); wh = (int) (i / LAT % H); }
                     e2 = std::max(e2, std::fabs((double) o2[i] - ref[i]));
+                    e3 = std::max(e3, std::fabs((double) o3[i] - ref[i]));
                 }
-                const bool ok = e1 <= 0.02 * mag + 1e-4, ok2 = e2 <= 0.02 * mag + 1e-4;
-                fails += !ok + !ok2;
-                std::printf("attn %s T=%2d n_kv=%5d  |ref|max %.4f  kernel err %.2e %s (worst t%d h%d: %.5f vs %.5f)  gemm err %.2e %s\n",
+                const bool ok = e1 <= 0.02 * mag + 1e-4, ok2 = e2 <= 0.02 * mag + 1e-4, ok3 = e3 <= 0.02 * mag + 1e-4;
+                fails += !ok + !ok2 + !ok3;
+                std::printf("attn %s T=%2d n_kv=%5d  |ref|max %.4f  kernel err %.2e %s (worst t%d h%d: %.5f vs %.5f)  gemm err %.2e %s  tc err %.2e %s\n",
                             kv_mode == m4k::KV_F16 ? "f16 " : "int8", T, n_kv, mag, e1, ok ? "ok  " : "FAIL", wt, wh,
                             wt >= 0 ? o[((size_t) wt * H + wh) * LAT] : 0.f, wt >= 0 ? (float) ref[((size_t) wt * H + wh) * LAT] : 0.f,
-                            e2, ok2 ? "ok" : "FAIL");
-                for (void* p : {cache, (void*) scl, (void*) dQ, (void*) part, (void*) O, (void*) O2, (void*) S, (void*) dpos,
+                            e2, ok2 ? "ok  " : "FAIL", e3, ok3 ? "ok" : "FAIL");
+                for (void* p : {cache, (void*) scl, (void*) dQ, (void*) part, (void*) O, (void*) O2, (void*) O3, (void*) S, (void*) dpos,
                                 (void*) K16, (void*) Q16, (void*) P})
                     CK(cudaFree(p));
             }
+        }
+    }
+    // speed at long contexts (int8 cache, random rows): both decode kernels, per layer and per token (36 layers)
+    for (int n_kv : {4096, 16384, 32768, 65536}) {
+        for (int T : {1, 4}) {
+            const int pos0 = n_kv - T;
+            std::vector<int8_t> c8((size_t) n_kv * D);
+            for (auto& v : c8) v = (int8_t) ((int) (rng() % 255) - 127);
+            std::vector<float> sc((size_t) n_kv * 2, 0.0004f), Q((size_t) T * H * D);
+            for (int r = 0; r < n_kv; ++r) sc[(size_t) r * 2 + 1] = 0.02f;
+            for (auto& v : Q) v = nd(rng) * 2.f;
+            std::vector<int32_t> pos((size_t) T);
+            for (int t = 0; t < T; ++t) pos[(size_t) t] = pos0 + t;
+            void* cache = nullptr;
+            float *scl = nullptr, *dQ = nullptr, *part = nullptr, *O1 = nullptr, *O2 = nullptr;
+            int32_t* dpos = nullptr;
+            CK(cudaMalloc(&cache, c8.size()));
+            CK(cudaMemcpy(cache, c8.data(), c8.size(), cudaMemcpyHostToDevice));
+            CK(cudaMalloc(&scl, sc.size() * 4));
+            CK(cudaMemcpy(scl, sc.data(), sc.size() * 4, cudaMemcpyHostToDevice));
+            CK(cudaMalloc(&dQ, Q.size() * 4));
+            CK(cudaMemcpy(dQ, Q.data(), Q.size() * 4, cudaMemcpyHostToDevice));
+            CK(cudaMalloc(&dpos, (size_t) T * 4));
+            CK(cudaMemcpy(dpos, pos.data(), (size_t) T * 4, cudaMemcpyHostToDevice));
+            CK(cudaMalloc(&part, m4k::mla_decode_part_floats(T, H) * 4));
+            CK(cudaMalloc(&O1, (size_t) T * H * LAT * 4));
+            CK(cudaMalloc(&O2, (size_t) T * H * LAT * 4));
+            cudaEvent_t e0, e1;
+            CK(cudaEventCreate(&e0));
+            CK(cudaEventCreate(&e1));
+            float ms[2] = {0, 0};
+            for (int impl : {m4k::ATTN_SIMT, m4k::ATTN_TC}) {
+                float* O = impl == m4k::ATTN_TC ? O2 : O1;
+                m4k::mla_attn_decode(dQ, cache, scl, m4k::KV_I8, dpos, T, H, scale, part, O, s, impl);   // warm-up
+                CK(cudaEventRecord(e0, s));
+                for (int r = 0; r < 20; ++r) m4k::mla_attn_decode(dQ, cache, scl, m4k::KV_I8, dpos, T, H, scale, part, O, s, impl);
+                CK(cudaEventRecord(e1, s));
+                CK(cudaEventSynchronize(e1));
+                CK(cudaEventElapsedTime(&ms[impl == m4k::ATTN_TC], e0, e1));
+            }
+            std::vector<float> a((size_t) T * H * LAT), b(a.size());
+            CK(cudaMemcpy(a.data(), O1, a.size() * 4, cudaMemcpyDeviceToHost));
+            CK(cudaMemcpy(b.data(), O2, b.size() * 4, cudaMemcpyDeviceToHost));
+            double d = 0, mag = 0;
+            for (size_t i = 0; i < a.size(); ++i) {
+                d = std::max(d, (double) std::fabs(a[i] - b[i]));
+                mag = std::max(mag, (double) std::fabs(a[i]));
+            }
+            std::printf("speed n_kv=%5d T=%d: kernel %.3f ms/layer (%.1f ms/token), tc %.3f ms/layer (%.1f ms/token), "
+                        "x%.1f, max diff %.2e of %.3f\n", n_kv, T, ms[0] / 20, ms[0] / 20 * 36, ms[1] / 20, ms[1] / 20 * 36,
+                        ms[0] / std::max(1e-6f, ms[1]), d, mag);
+            CK(cudaEventDestroy(e0));
+            CK(cudaEventDestroy(e1));
+            for (void* p : {cache, (void*) scl, (void*) dQ, (void*) part, (void*) O1, (void*) O2, (void*) dpos}) CK(cudaFree(p));
         }
     }
     std::printf("selftest-attn: %s (%d failed)\n", fails ? "FAILED" : "passed", fails);
