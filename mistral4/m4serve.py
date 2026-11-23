@@ -639,7 +639,7 @@ def make_handler(S: State):
         def _auth(self) -> bool:
             if not S.api_key:
                 return True
-            if self.headers.get("Authorization", "") == "Bearer " + S.api_key:
+            if self.headers.get("Authorization", "") == "Bearer " + S.api_key or self.headers.get("x-api-key", "") == S.api_key:
                 return True
             self._json(401, {"error": {"message": "invalid API key"}})
             return False
@@ -814,7 +814,9 @@ def main():
     ap.add_argument("--vision-cpu", action="store_true", help="run the image encoder on the CPU (saves ~1.5 GiB VRAM)")
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=8080)
-    ap.add_argument("--api-key", default=os.environ.get("M4_API_KEY"))
+    ap.add_argument("--api-key", default=os.environ.get("M4_API_KEY") or os.environ.get("STRATA_API_KEY"),
+                    help="require this key (Authorization: Bearer ... or x-api-key); default $M4_API_KEY, else "
+                         "$STRATA_API_KEY - the variable `strata monitor` sends by itself; 'none' = no key")
     ap.add_argument("--model-name", default="mistral-small-4")
     ap.add_argument("--system-prompt", default="auto",
                     help="for requests without a system message: auto (Mistral's SYSTEM_PROMPT.txt from the --tokenizer "
@@ -830,7 +832,8 @@ def main():
         a.system_prompt, a.tokenizer if not os.path.exists(a.tokenizer) else "mistralai/Mistral-Small-4-119B-2603")
     S.vision = Vision(a.vision, a.mmproj, a.model, a.vision_cpu) if a.mmproj else None
     S.engine = Engine(a.engine, a.model, shlex.split(a.engine_args))
-    S.model_name, S.api_key = a.model_name, a.api_key
+    S.model_name, S.api_key = a.model_name, (None if (a.api_key or "").strip().lower() in ("", "none") else a.api_key.strip())
+    log("API key:", "required" if S.api_key else "none (every client on the network may use this server)")
     S.tele = Telemetry(a.model_name + " (" + os.path.basename(a.model) + ")")
     S.tele.context = S.engine.info.get("ctx")
     S.defaults = {"max_tokens": a.max_tokens, "temperature": a.temperature, "top_p": a.top_p}
