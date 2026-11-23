@@ -359,6 +359,9 @@ bool kq512_ok(int type) {
 }
 }  // namespace
 
+static bool g_allow_large = false;
+void native_fmt_allow_large(bool allow) { g_allow_large = allow; }
+
 bool native_fmt(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, NativeFmt& f, std::string& err) {
     init_once();
     // The trellis types (Gyro, ggml types 144-146) are not in a ggml built from upstream (and an upstream ggml indexes its
@@ -404,7 +407,8 @@ bool native_fmt(int gu_type, int d_type, int64_t n_embd, int64_t n_ff, NativeFmt
     }
     f.act_bytes = row_size_of(vdt_g, n_embd);
     f.h_bytes = row_size_of(vdt_d, n_ff);
-    if (f.act_bytes > kNativeActBytes || f.h_bytes > kNativeHBytes) {
+    // strata-m4 sizes its own buffers from act_bytes / h_bytes (native_fmt_allow_large); Strata's pool has fixed ones
+    if (!g_allow_large && (f.act_bytes > kNativeActBytes || f.h_bytes > kNativeHBytes)) {
         err = "native experts: activation larger than the pool's buffers";
         return false;
     }
