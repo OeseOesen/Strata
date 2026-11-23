@@ -94,6 +94,16 @@ Wichtige Engine-Optionen (`strata-m4 --help`):
 | `--eagle PFAD` | Eagle-Kopf (Ordner mit `consolidated.safetensors` und `params.json`) |
 | `--eagle-k N`, `--eagle-p P` | Eagle: höchstens N Entwürfe pro Fenster; Abbruch, wenn die Kettenwahrscheinlichkeit unter P fällt |
 
+## Prompt-Streaming (wie Strata)
+
+Ab `--pf-min` Tokens (Standard 768) rechnet ein Prompt-Abschnitt alle Experten auf der GPU: die im VRAM aus ihrem Slot,
+die übrigen werden aus den beim Treiber gepinnten RAM-Bereichen beider NUMA-Nodes per DMA in einen Ring von VRAM-Slots
+kopiert (Kopier-Stream, die Hälften der split-Aufteilung werden dabei zusammengesetzt), während der Rechen-Stream jedes
+Experten nach f16 entpackt und Gate/Up, SwiGLU und Down als Tensor-Core-GEMMs rechnet.  PCIe Gen3 x16 schafft die
+~37 GB CPU-Experten in ~3 s: Abschnitte von 2048 Tokens (Standard mit Streaming) lesen damit grob 700 tok/s, 4096 grob
+1300 tok/s.  Kleinere Abschnitte (Agenten-Schritte) rechnet weiter der CPU-Pool.  Dichte Produkte ab 64 Zeilen laufen
+ebenfalls als f16-GEMM (`--pf-gemm`).  Schalter: `--pf-stream 0|1`, `--pf-min N`, `--pf-ring N`, `--chunk N`.
+
 ## Strata Monitor
 
 m4serve liefert Strata's Telemetrie-Schnittstelle (`GET /v1/telemetry`, Schema 1, und `/v1/status`). Der Monitor aus dem
