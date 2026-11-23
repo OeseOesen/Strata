@@ -81,4 +81,9 @@ void argmax_rows(const float* x, int n, int rows, int32_t* out, cudaStream_t s);
 /// Embedding rows given as floats (an image's rows): out[row[i]] = src[i].
 void scatter_rows(const float* src, const int32_t* rows, int n_rows, int n_embd, float* out, cudaStream_t s);
 
+/// EAGLE input rows: out[t] = [a[t] | b[t]], rows of n floats each.
+void concat2(const float* a, const float* b, float* out, int n, int rows, cudaStream_t s);
+/// One row: the first maximum and its softmax probability.
+void argmax_prob(const float* x, int n, int32_t* out, float* prob, cudaStream_t s);
+
 }  // namespace m4k
