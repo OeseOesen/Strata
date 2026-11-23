@@ -89,11 +89,13 @@ Wichtige Engine-Optionen (`strata-m4 --help`):
 | `--vram-reserve`, `--vram-experts` | VRAM-Reserve und Obergrenze für Expertenslots |
 | `--workers N`, `--host-core N` | Worker pro Node; der Kern des GPU-fütternden Host-Threads |
 | `--ngram-mib N` | globale n-Gramm-Tabelle auf dem anderen Node |
+| `--eagle PFAD` | Eagle-Kopf (Ordner mit `consolidated.safetensors` und `params.json`) |
+| `--eagle-k N`, `--eagle-p P` | Eagle: höchstens N Entwürfe pro Fenster; Abbruch, wenn die Kettenwahrscheinlichkeit unter P fällt |
 
 ## Stand und offene Punkte
 
 - **Ungetestet auf Hardware.** Alles ist für sm_70 kompiliert und geprüft (ptxas: keine Spills, 45,8 KB Shared Memory im Decode-Kernel). Der NUMA-Pool ist gegen eine Float-Referenz getestet, beide Policies. Gelaufen ist es aber noch nicht auf einer V100. Die erste Runde auf dem Server ist `parity.sh`.
-- **Eagle-Drafter** (`Mistral-Small-4-119B-2603-eagle`): noch nicht eingebaut. Im Moment entwirft der n-Gramm-Drafter (Prompt-Lookup plus globale Tabelle). Eagle ist der nächste Schritt, sobald die Parität stimmt.
+- **Eagle-Drafter** (`Mistral-Small-4-119B-2603-eagle`, `--eagle PFAD`): eingebaut, noch in der Erprobung. Der Kopf (2 MLA-Schichten, dichte FFN, float8 → Q8_0, ca. 0,5 GB VRAM) läuft hinter jedem Fenster über die angenommenen Zeilen und entwirft eine Kette von bis zu `--eagle-k` Tokens (Standard 3), solange das Produkt der Wahrscheinlichkeiten über `--eagle-p` (Standard 0,3) liegt. Findet der n-Gramm-Lookup im Verlauf einen Treffer (Code-Bearbeitung), hat dieser Vorrang. Prüfen: `strata-m4 ... --eagle PFAD --eagle-acc ids.txt` (Treffsicherheit des Kopfes bei vorgegebenem Text).
 - **Adaptives Umschichten** der Experten im laufenden Betrieb fehlt noch. Die Platzierung folgt der Hitze-Datei des letzten Laufs.
 - **Lange Prompts:** Fehltreffer gehen an die CPU. Ab einigen tausend Token pro Chunk wäre es schneller, die Experten über PCIe in VRAM-Staging-Puffer zu streamen. Das ist geplant.
 - Bilder laufen über llama.cpps mtmd (Pixtral-Tower aus der mmproj-GGUF). Mit `--vision-cpu` belegen sie kein VRAM.
