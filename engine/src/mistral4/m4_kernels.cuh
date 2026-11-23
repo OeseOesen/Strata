@@ -37,7 +37,7 @@ void mla_kv_write(const float* kvp, const float* kv_norm, const float* rope_tab,
                   int kv_mode, void* cache, float* scales, float eps, cudaStream_t s);
 /// MLA, step 2: q_pe = rope(q[t][h][64:128]) written to Qf[t][h][256:320]; Qf[t][h][0:256] holds q_nope absorbed
 /// through wk_b (a cuBLAS batched GEMM before this call).  Optional llama-4 style temperature scaling of the whole
-/// row: s = log(floor((pos+1)/floor_scale)+1)*temp_scale + 1 (temp_scale 0 = off).
+/// row: s = log(floor(pos/floor_scale)+1)*temp_scale + 1 (temp_scale 0 = off; llama.cpp's form).
 void mla_q_rope(const float* q, float* Qf, const float* rope_tab, const int32_t* pos, int T, int n_head,
                 float temp_scale, float temp_floor, cudaStream_t s);
 /// MLA, step 3 (decode / verify windows, T <= 16): O[t][h][0:256] = softmax_k(scale * Qf[t][h] . K[k]) V[k] over
