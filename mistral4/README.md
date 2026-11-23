@@ -94,6 +94,16 @@ Wichtige Engine-Optionen (`strata-m4 --help`):
 | `--eagle PFAD` | Eagle-Kopf (Ordner mit `consolidated.safetensors` und `params.json`) |
 | `--eagle-k N`, `--eagle-p P` | Eagle: höchstens N Entwürfe pro Fenster; Abbruch, wenn die Kettenwahrscheinlichkeit unter P fällt |
 
+## Strata Monitor
+
+m4serve liefert Strata's Telemetrie-Schnittstelle (`GET /v1/telemetry`, Schema 1, und `/v1/status`). Der Monitor aus dem
+Strata-CLI zeigt die Engine damit wie einen Strata-Server: Slot, Warteschlange, Antwort- und Prompt-Tempo, letzte
+Anfragen, GPU (nvidia-smi) und RAM.
+
+    strata monitor --url http://127.0.0.1:8080      # oder STRATA_URL setzen; auf Port 8095 geht es ohne --url
+
+Mit API-Key: `strata monitor --url … --credential-env M4_API_KEY`.
+
 ## Stand und offene Punkte
 
 - **Ungetestet auf Hardware.** Alles ist für sm_70 kompiliert und geprüft (ptxas: keine Spills, 45,8 KB Shared Memory im Decode-Kernel). Der NUMA-Pool ist gegen eine Float-Referenz getestet, beide Policies. Gelaufen ist es aber noch nicht auf einer V100. Die erste Runde auf dem Server ist `parity.sh`.
