@@ -707,7 +707,7 @@ def make_handler(S: State):
 
         def _full(self) -> bool:
             """--max-queue requests waiting already: refused at once (503), as Strata's admission does."""
-            if S.tele.waiting() >= S.tele.max_queue:
+            if gate.locked() and S.tele.waiting() >= S.tele.max_queue:
                 S.tele.reject()
                 self._json(503, {"error": {"message": f"server busy: {S.tele.max_queue} requests are waiting",
                                            "type": "server_error", "code": "queue_full"}})
