@@ -180,8 +180,17 @@ say "Python environment for m4serve"
 if [[ -f "$REPO/terminal/requirements-monitor.txt" ]]; then
   "$PREFIX/venv/bin/pip" install -q -r "$REPO/terminal/requirements-monitor.txt" || echo "note: textual for strata monitor not installed"
 fi
-cp "$HERE/m4serve.py" "$HERE/bench.sh" "$HERE/parity.sh" "$HERE/sanity.sh" "$HERE/speed.sh" "$HERE/longctx.sh" "$HERE/start-m4.sh" "$HERE/monitor-m4.sh" "$PREFIX/"
+cp "$HERE/m4serve.py" "$HERE/m4cli.py" "$HERE/bench.sh" "$HERE/parity.sh" "$HERE/sanity.sh" "$HERE/speed.sh" "$HERE/longctx.sh" "$HERE/start-m4.sh" "$HERE/monitor-m4.sh" "$PREFIX/"
 chmod +x "$PREFIX/bench.sh" "$PREFIX/parity.sh" "$PREFIX/sanity.sh" "$PREFIX/speed.sh" "$PREFIX/longctx.sh" "$PREFIX/start-m4.sh" "$PREFIX/monitor-m4.sh"
+# the `strata-m4` command (launch, serve, stop, status, monitor, logs, config, doctor, bench ...) on the PATH
+mkdir -p "$HOME/.local/bin"
+cat > "$HOME/.local/bin/strata-m4" <<EOS
+#!/usr/bin/env bash
+export M4_HOME="$PREFIX" M4_SRC="\${M4_SRC:-$REPO}"
+exec "$PREFIX/venv/bin/python" "$PREFIX/m4cli.py" "\$@"
+EOS
+chmod +x "$HOME/.local/bin/strata-m4"
+case ":$PATH:" in *":$HOME/.local/bin:"*) ;; *) echo "note: ~/.local/bin is not on PATH yet (log in again, or: export PATH=\"\$HOME/.local/bin:\$PATH\")";; esac
 
 say "configuration"
 ENVF="$PREFIX/m4.env"
@@ -195,7 +204,7 @@ M4_TOKENIZER=${TOKENIZER}
 # --ram-gpu-node / --ram-other-node (GiB per expert arena), --vram-reserve (GiB)
 M4_ENGINE_ARGS="--ctx 65536 --kv int8 --spec 6 --numa split"
 M4_HOST=127.0.0.1
-M4_PORT=8080
+M4_PORT=8095
 # M4_API_KEY=change-me
 M4_LLAMA=$PREFIX/src/llama.cpp/build/bin
 EOF

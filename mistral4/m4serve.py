@@ -17,6 +17,7 @@ One request runs at a time (the engine keeps one prompt cache); others wait in l
 from __future__ import annotations
 
 import argparse
+import signal
 import base64
 import collections
 import hashlib
@@ -416,6 +417,8 @@ class Telemetry:
         self.cur: dict | None = None              # the request on the engine
         self.recent = collections.deque(maxlen=50)
         self.totals = {"since": self.boot, "requests": 0, "prompt_tokens": 0, "output_tokens": 0}
+        self.max_queue, self.queue_timeout = 16, 900.0
+        self.rejected = self.timeouts = self.disconnects = 0
         self.last_answer = None
         self.last_prefill = None
         self.devices: list[dict] = []
@@ -442,6 +445,14 @@ class Telemetry:
             self.cur = {**row, "state": "reading", "admitted_at": now, "generated": 0, "first_at": None}
             self._event(rid, "admitted")
             self._event(rid, "reading")
+
+    def reject(self):
+        with self.lock:
+            self.rejected += 1
+
+    def waiting(self) -> int:
+        with self.lock:
+            return len(self.queue)
 
     def progress(self, read: int, total: int, reused: int):
         with self.lock:
@@ -481,8 +492,13 @@ class Telemetry:
             c = self.cur if self.cur and self.cur["id"] == rid else None
             now = time.time()
             st = st or {}
-            event = {"stop": "finished", "length": "finished", "cancel": "cancelled", "disconnect": "disconnected"}.get(outcome, "error")
+            event = {"stop": "finished", "length": "finished", "cancel": "cancelled", "disconnect": "disconnected",
+                     "timeout": "timeout"}.get(outcome, "error")
             self._event(rid, event, outcome)
+            if outcome == "timeout":
+                self.timeouts += 1
+            elif outcome == "disconnect":
+                self.disconnects += 1
             if c is not None:
                 n_prompt, n_gen = int(st.get("n_prompt", c.get("prompt_tokens") or 0)), int(st.get("n_gen", c["generated"]))
                 pms, gms = float(st.get("prompt_ms", 0) or 0), float(st.get("gen_ms", 0) or 0)
@@ -543,20 +559,20 @@ class Telemetry:
             queue = [dict(r) for r in self.queue.values()]
             if c:
                 live_rate = (c["generated"] / (now - c["first_at"])) if c["first_at"] and now > c["first_at"] and c["generated"] > 1 else None
-                slot = {"slot": 0, "group": None, "replica": None, "request_id": c["id"], "state": c["state"],
+                slot = {"slot": 0, "group": 0, "replica": None, "request_id": c["id"], "state": c["state"],
                         "held_tokens": None, "prompt_tokens": c.get("prompt_tokens"),
                         "prompt_read": c.get("prompt_tokens") if c["first_at"] else c.get("prompt_read"),
                         "generated": c["generated"],
                         "elapsed_s": round(now - c["admitted_at"], 2), "tok_s": round(live_rate, 1) if live_rate else None}
             else:
                 live_rate = None
-                slot = {"slot": 0, "state": "idle", "held_tokens": None}
+                slot = {"slot": 0, "group": 0, "state": "idle", "held_tokens": None}
             requests = [{"id": r["id"], "state": "queued", "queued_at": r["queued_at"], "admitted_at": None, "slot": None,
                          "group": None, "replica": None, "prompt_tokens": r.get("prompt_tokens"), "prompt_read": None,
                          "generated": None, "first_engine_token_s": None} for r in queue]
             if c:
                 requests.insert(0, {"id": c["id"], "state": c["state"], "queued_at": c["queued_at"], "admitted_at": c["admitted_at"],
-                                    "slot": 0, "group": None, "replica": None, "prompt_tokens": c.get("prompt_tokens"),
+                                    "slot": 0, "group": 0, "replica": None, "prompt_tokens": c.get("prompt_tokens"),
                                     "prompt_read": slot["prompt_read"], "generated": c["generated"],
                                     "first_engine_token_s": round(c["first_at"] - c["admitted_at"], 3) if c["first_at"] else None})
             answer = (live_rate, None) if live_rate else (self.last_answer or (None, None))
@@ -565,7 +581,11 @@ class Telemetry:
                 "instance": {"id": self.instance, "boot_time": self.boot, "server": "m4serve (strata-m4)", "state": "ready"},
                 "model": {"id": self.model_id, "loaded": True, "context": self.context},
                 "work": {"slots_requested": 1, "slots_effective": 1, "active": 1 if c else 0, "queued": len(queue),
-                         "waiting": len(queue), "outside_slots": 0, "groups": None, "requests_omitted": 0,
+                         "waiting": len(queue), "outside_slots": 0, "groups": 1, "requests_omitted": 0,
+                         "max_queue": self.max_queue, "admission_limit": 1 + self.max_queue,
+                         "admission_reserved": (1 if c else 0) + len(queue), "admission_rejected": self.rejected,
+                         "queue_timeout_s": self.queue_timeout, "queue_timeouts": self.timeouts,
+                         "client_disconnect_cancels": self.disconnects,
                          "oldest_queue_s": round(max((now - r["queued_at"] for r in queue), default=0), 2),
                          "slots": [slot], "requests": requests[:50], **self._batch(now)},
                 "rates": {"answer_tok_s": round(answer[0], 1) if answer[0] else None,
@@ -603,18 +623,28 @@ class State:
 def make_handler(S: State):
     gate = threading.Lock()
 
+    class Busy(Exception):
+        def __init__(self, code: int, message: str):
+            super().__init__(message)
+            self.code, self.message = code, message
+
     def run(req: dict, on_tokens, cancelled) -> dict:
-        """One engine request behind the line, with its telemetry transitions."""
+        """One engine request behind the line (--queue-timeout s at most), with its telemetry transitions."""
         rid = S.tele.queued(len(req.get("ids") or []))
         st, outcome = None, "error"
         try:
-            with gate:
+            if not gate.acquire(timeout=S.tele.queue_timeout):
+                outcome = "timeout"
+                raise Busy(503, f"waited {S.tele.queue_timeout:.0f} s in the queue; the server is busy")
+            try:
                 S.tele.admitted(rid)
 
                 def tok(ids_):
                     S.tele.tokens(len(ids_))
                     on_tokens(ids_)
                 st = S.engine.generate(req, tok, cancelled, S.tele.progress, S.tele.window)
+            finally:
+                gate.release()
             fin = st.get("finish")
             outcome = "stop" if fin == "stop" else "length" if fin in ("length", "context") else \
                 "disconnect" if cancelled() else "cancel" if fin == "abort" else "error"
@@ -675,6 +705,15 @@ def make_handler(S: State):
             log(f"404: POST {self.path} (this server speaks /v1/chat/completions and /v1/completions)")
             self._json(404, {"error": {"message": f"not found: {self.path}; use /v1/chat/completions"}})
 
+        def _full(self) -> bool:
+            """--max-queue requests waiting already: refused at once (503), as Strata's admission does."""
+            if S.tele.waiting() >= S.tele.max_queue:
+                S.tele.reject()
+                self._json(503, {"error": {"message": f"server busy: {S.tele.max_queue} requests are waiting",
+                                           "type": "server_error", "code": "queue_full"}})
+                return True
+            return False
+
         def _too_long(self, n: int) -> bool:
             """A prompt that does not fit the engine's context is refused the way OpenAI does it (agents read the code
             and compact their history) - never answered with an empty 'length'."""
@@ -706,7 +745,7 @@ def make_handler(S: State):
             except Exception as e:
                 log(f"400 on /v1/chat/completions: {type(e).__name__}: {e}")
                 return self._json(400, {"error": {"message": f"{type(e).__name__}: {e}", "type": "invalid_request_error"}})
-            if self._too_long(len(ids)):
+            if self._too_long(len(ids)) or self._full():
                 return
             req = self._gen_req(body, ids, embd, key)
             stream = bool(body.get("stream"))
@@ -714,7 +753,10 @@ def make_handler(S: State):
             created = int(time.time())
             out: list[int] = []
             if not stream:
-                st = run(req, out.extend, lambda: False)
+                try:
+                    st = run(req, out.extend, lambda: False)
+                except Busy as b:
+                    return self._json(b.code, {"error": {"message": b.message, "type": "server_error", "code": "queue_timeout"}})
                 content, reasoning, calls = S.chat.split([t for t in out if t != S.chat.eos])
                 msg = {"role": "assistant", "content": content or (None if calls else "")}
                 if reasoning:
@@ -765,7 +807,16 @@ def make_handler(S: State):
                     chunk({"content": content[len(sent["content"]):]})
                     sent["content"] = content
 
-            st = run(req, on_tokens, lambda: gone[0])
+            try:
+                st = run(req, on_tokens, lambda: gone[0])
+            except Busy as b:
+                send({"error": {"message": b.message, "type": "server_error", "code": "queue_timeout"}})
+                try:
+                    self.wfile.write(b"data: [DONE]\n\n")
+                    self.wfile.flush()
+                except Exception:
+                    pass
+                return
             content, reasoning, calls = S.chat.split([t for t in out if t != S.chat.eos])
             if content.startswith(sent["content"]) and len(content) > len(sent["content"]):
                 chunk({"content": content[len(sent["content"]):]})
@@ -787,11 +838,14 @@ def make_handler(S: State):
                 ids = prompt
             else:
                 ids = S.chat.tok.encode(str(prompt), bos=True, eos=False)
-            if self._too_long(len(ids)):
+            if self._too_long(len(ids)) or self._full():
                 return
             req = self._gen_req(body, ids, None, "")
             out: list[int] = []
-            st = run(req, out.extend, lambda: False)
+            try:
+                st = run(req, out.extend, lambda: False)
+            except Busy as b:
+                return self._json(b.code, {"error": {"message": b.message, "type": "server_error", "code": "queue_timeout"}})
             text = S.chat.tok.decode([t for t in out if t != S.chat.eos], special_token_policy=SpecialTokenPolicy.IGNORE)
             self._json(200, {"id": "cmpl-" + uuid.uuid4().hex[:24], "object": "text_completion", "created": int(time.time()),
                              "model": S.model_name, "choices": [{"index": 0, "text": text,
@@ -821,6 +875,8 @@ def main():
     ap.add_argument("--system-prompt", default="auto",
                     help="for requests without a system message: auto (Mistral's SYSTEM_PROMPT.txt from the --tokenizer "
                          "repo), none, or a file")
+    ap.add_argument("--max-queue", type=int, default=16, help="requests that may wait for the engine (more: 503 at once)")
+    ap.add_argument("--queue-timeout", type=float, default=900.0, help="seconds a request may wait for the engine (then 503)")
     ap.add_argument("--max-tokens", type=int, default=4096)
     ap.add_argument("--temperature", type=float, default=0.1)
     ap.add_argument("--top-p", type=float, default=1.0)
@@ -836,8 +892,14 @@ def main():
     log("API key:", "required" if S.api_key else "none (every client on the network may use this server)")
     S.tele = Telemetry(a.model_name + " (" + os.path.basename(a.model) + ")")
     S.tele.context = S.engine.info.get("ctx")
+    S.tele.max_queue, S.tele.queue_timeout = max(0, a.max_queue), max(1.0, a.queue_timeout)
     S.defaults = {"max_tokens": a.max_tokens, "temperature": a.temperature, "top_p": a.top_p}
     srv = ThreadingHTTPServer((a.host, a.port), make_handler(S))
+
+    def _stop(signum, frame):   # SIGINT and SIGTERM both end the server cleanly (a shell's background job ignores
+        raise KeyboardInterrupt  # SIGINT unless the program sets its own handler: the "zombie" m4serve of AUFTRAG-18)
+    signal.signal(signal.SIGINT, _stop)
+    signal.signal(signal.SIGTERM, _stop)
     log(f"listening on http://{a.host}:{a.port}/v1 (model name '{a.model_name}')")
     try:
         srv.serve_forever()
