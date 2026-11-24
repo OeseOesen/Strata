@@ -176,8 +176,12 @@ fi
 say "Python environment for m4serve"
 "$PREFIX/venv/bin/pip" install -q --upgrade pip
 "$PREFIX/venv/bin/pip" install -q "mistral-common[image]>=1.13" "huggingface_hub"
-cp "$HERE/m4serve.py" "$HERE/bench.sh" "$HERE/parity.sh" "$HERE/sanity.sh" "$HERE/speed.sh" "$HERE/longctx.sh" "$PREFIX/"
-chmod +x "$PREFIX/bench.sh" "$PREFIX/parity.sh" "$PREFIX/sanity.sh" "$PREFIX/speed.sh" "$PREFIX/longctx.sh"
+# strata monitor's terminal UI (Strata's own pin), so the monitor runs from this venv
+if [[ -f "$REPO/terminal/requirements-monitor.txt" ]]; then
+  "$PREFIX/venv/bin/pip" install -q -r "$REPO/terminal/requirements-monitor.txt" || echo "note: textual for strata monitor not installed"
+fi
+cp "$HERE/m4serve.py" "$HERE/bench.sh" "$HERE/parity.sh" "$HERE/sanity.sh" "$HERE/speed.sh" "$HERE/longctx.sh" "$HERE/start-m4.sh" "$HERE/monitor-m4.sh" "$PREFIX/"
+chmod +x "$PREFIX/bench.sh" "$PREFIX/parity.sh" "$PREFIX/sanity.sh" "$PREFIX/speed.sh" "$PREFIX/longctx.sh" "$PREFIX/start-m4.sh" "$PREFIX/monitor-m4.sh"
 
 say "configuration"
 ENVF="$PREFIX/m4.env"
