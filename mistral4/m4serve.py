@@ -362,6 +362,7 @@ def load_default_system_prompt(spec: str, repo: str) -> str | None:
 
 class Chat:
     default_system: str | None = None
+    default_effort: str | None = None   # for requests that name none: "none", "high" (None: the model's own default)
 
     def __init__(self, tokenizer: str):
         if os.path.exists(tokenizer):
@@ -397,13 +398,9 @@ class Chat:
                         u = part["image_url"]["url"] if isinstance(part["image_url"], dict) else part["image_url"]
                         images.append(image_bytes_of(u))
         kw = {}
-        eff = body.get("reasoning_effort")
-        if eff is None and isinstance(body.get("reasoning"), dict):   # the Responses-style spelling
-            eff = body["reasoning"].get("effort")
-        if eff is not None:
-            # Mistral Small 4 knows two levels: "none" and "high"; agents also send minimal / low / medium / xhigh
-            e = str(eff).strip().lower()
-            kw["reasoning_effort"] = "none" if e in ("none", "off", "minimal", "false", "0", "") else "high"
+        eff = effort_of(body, self.default_effort)
+        if eff:
+            kw["reasoning_effort"] = eff
         msgs, tools = normalize_messages(messages), normalize_tools(body.get("tools"))
         if self.default_system and not (msgs and msgs[0].get("role") == "system"):
             msgs.insert(0, {"role": "system", "content": self.default_system})
@@ -540,7 +537,18 @@ class Chat:
         return calls
 
 
-def request_line(rid: str, st: dict, outcome: str) -> str:
+def effort_of(body: dict, default: str | None) -> str | None:
+    """The request's reasoning effort as Mistral Small 4 knows it: "none" or "high" (agents also send minimal / low /
+    medium / xhigh); a request without one gets default (None: the model's own default)."""
+    eff = body.get("reasoning_effort")
+    if eff is None and isinstance(body.get("reasoning"), dict):   # the Responses-style spelling
+        eff = body["reasoning"].get("effort")
+    if eff is None:
+        return default
+    return "none" if str(eff).strip().lower() in ("none", "off", "minimal", "false", "0", "") else "high"
+
+
+def request_line(rid: str, st: dict, outcome: str, req: dict | None = None) -> str:
     """One log line per request: what was read (and how), what was written."""
     n, reused, gen = int(st.get("n_prompt") or 0), int(st.get("n_reused") or 0), int(st.get("n_gen") or 0)
     read, pms, gms = n - reused, float(st.get("prompt_ms") or 0), float(st.get("gen_ms") or 0)
@@ -555,6 +563,9 @@ def request_line(rid: str, st: dict, outcome: str) -> str:
             s += f" (eagle {st.get('eagle_accepted', 0)}/{st.get('eagle_drafted', 0)})"
     if st.get("slot") is not None and int(st.get("slot", -1)) >= 0:
         s += f"; slot {st['slot']}"
+    if req:   # how the request asked to be answered
+        s += f"; thinking {req.get('_think') or 'model default'}, temperature {req.get('temp')}, limit {req.get('max_new')}" + \
+             (" (client)" if req.get("_limit_client") else "")
     return s + f"; {outcome}"
 
 
@@ -874,7 +885,7 @@ def make_handler(S: State):
         finally:
             S.tele.finished(rid, st, outcome)
             if st:
-                log(request_line(rid, st, outcome))
+                log(request_line(rid, st, outcome, req))
 
     class H(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
@@ -964,8 +975,14 @@ def make_handler(S: State):
             d = S.defaults
             ctx = int(S.engine.info.get("ctx") or 0)
             auto = d["max_tokens"] or (max(256, min(32768, ctx - len(ids) - 64)) if ctx else 4096)
-            r = {"ids": ids, "max_new": int(body.get("max_tokens") or body.get("max_completion_tokens") or auto),
-                 "temp": float(body.get("temperature", d["temperature"])), "top_p": float(body.get("top_p", d["top_p"])),
+            think = effort_of(body, S.chat.default_effort)
+            temp = d["temperature"]
+            if temp is None:   # Mistral's advice: 0.7 when the model thinks, low (0.0 .. 0.7 by task) when it does not
+                temp = 0.7 if think == "high" else 0.1
+            limit = body.get("max_tokens") or body.get("max_completion_tokens")
+            r = {"ids": ids, "max_new": int(limit or auto), "_think": think, "_limit_client": bool(limit),
+                 "temp": float(body["temperature"]) if body.get("temperature") is not None else temp,
+                 "top_p": float(body.get("top_p", d["top_p"])),
                  "top_k": int(body.get("top_k", 0)), "min_p": float(body.get("min_p", 0.0)),
                  "stop_ids": [S.chat.eos], "seed": int(body.get("seed") or 0)}
             if "spec" in body:
@@ -1116,12 +1133,16 @@ def main():
     ap.add_argument("--queue-timeout", type=float, default=900.0, help="seconds a request may wait for the engine (then 503)")
     ap.add_argument("--max-tokens", type=int, default=0,
                     help="answer limit when a request sets none (default 0: the rest of the context, at most 32768)")
-    ap.add_argument("--temperature", type=float, default=0.1)
+    ap.add_argument("--temperature", type=float, default=None,
+                    help="for requests that name none (default: 0.7 when the model thinks, else 0.1 - Mistral's advice)")
+    ap.add_argument("--reasoning-effort", choices=("none", "high"), default=None,
+                    help="thinking for requests that name none (default: the model's own default)")
     ap.add_argument("--top-p", type=float, default=1.0)
     a = ap.parse_args()
 
     S = State()
     S.chat = Chat(a.tokenizer)
+    S.chat.default_effort = a.reasoning_effort
     S.chat.default_system = load_default_system_prompt(
         a.system_prompt, a.tokenizer if not os.path.exists(a.tokenizer) else "mistralai/Mistral-Small-4-119B-2603")
     S.vision = Vision(a.vision, a.mmproj, a.model, a.vision_cpu) if a.mmproj else None

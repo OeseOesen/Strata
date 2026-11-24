@@ -207,6 +207,10 @@ M4_HOST=127.0.0.1
 M4_PORT=8095
 # conversations at once (1-8): they share the KV cache of --ctx, each takes pages as it grows (strata-m4 launch --parallel N)
 # M4_PARALLEL=1
+# thinking for requests that ask for nothing: none | high (unset: the model's default); temperature for requests that
+# name none (unset: 0.7 when the model thinks, else 0.1 - Mistral's advice)
+# M4_REASONING=high
+# M4_TEMPERATURE=0.7
 # M4_API_KEY=change-me
 M4_LLAMA=$PREFIX/src/llama.cpp/build/bin
 EOF
@@ -223,7 +227,7 @@ After=network.target
 [Service]
 User=$USER
 EnvironmentFile=$ENVF
-ExecStart=/bin/bash -c 'exec $PREFIX/venv/bin/python $PREFIX/m4serve.py --engine $PREFIX/bin/strata-m4 --model "\$M4_MODEL" --tokenizer "\$M4_TOKENIZER" \${M4_MMPROJ:+--mmproj "\$M4_MMPROJ" --vision $PREFIX/bin/m4-vision} --engine-args "\$M4_ENGINE_ARGS" --host "\$M4_HOST" --port "\$M4_PORT" \${M4_PARALLEL:+--parallel \$M4_PARALLEL}'
+ExecStart=/bin/bash -c 'exec $PREFIX/venv/bin/python $PREFIX/m4serve.py --engine $PREFIX/bin/strata-m4 --model "\$M4_MODEL" --tokenizer "\$M4_TOKENIZER" \${M4_MMPROJ:+--mmproj "\$M4_MMPROJ" --vision $PREFIX/bin/m4-vision} --engine-args "\$M4_ENGINE_ARGS" --host "\$M4_HOST" --port "\$M4_PORT" \${M4_PARALLEL:+--parallel \$M4_PARALLEL} \${M4_TEMPERATURE:+--temperature \$M4_TEMPERATURE} \${M4_REASONING:+--reasoning-effort \$M4_REASONING}'
 Restart=on-failure
 RestartSec=10
 LimitMEMLOCK=infinity
