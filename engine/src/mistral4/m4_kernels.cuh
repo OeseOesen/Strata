@@ -71,6 +71,17 @@ void mla_attn_decode(const float* Qf, const void* cache, const float* scales, in
 /// `scale`, the causal softmax over scores S (column c = token c / n_head; keys <= pos[t]) into f16 P.
 void mla_cache_to_f16(const void* cache, const float* scales, int kv_mode, int n, __half* K16, cudaStream_t s,
                       KvMap map = {});
+// prompt attention per head (no absorption; nope = rope = 64, v = 128):
+//   Qm [T][H][128] f16 = [q_nope | q_pe] x scale (the engine passes kq_scale x log2 e)
+void mla_q_mha(const float* q, const float* Qf, const int32_t* pos, int T, int n_head, float scale, float temp_scale,
+               float temp_floor, __half* Qm, cudaStream_t s);
+//   Kh[n][h][64:128] = the f16 latent rows' rope part (rows K16 .. K16 + nb)
+void mla_k_rope_bcast(const __half* K16, int nb, int n_head, __half* Kh, cudaStream_t s);
+//   fused causal attention of T queries (positions pos0 ..) over keys kb0 .. kb0+nb-1 (Kh, Vh [nb][H][128] f16); a
+//   prompt's keys may come in several launches (first .. last; Oacc [T][H][128] and ML [T][H][2] carry the state);
+//   the last writes out [T][H * 128]
+void mla_fa_prefill(const __half* Qm, const __half* Kh, const __half* Vh, int T, int n_head, int pos0, int kb0, int nb,
+                    bool first, bool last, float* Oacc, float* ML, float* out, cudaStream_t s);
 void f32_to_f16_scaled(const float* x, __half* y, size_t n, float scale, cudaStream_t s);
 /// Column c is query token c / n_head of the sub-chunk, at position pos0 + c / n_head: keys beyond it get 0.
 void mla_softmax_causal(const float* S, __half* P, int n_kv, int cols, int n_head, int pos0, cudaStream_t s);

@@ -104,6 +104,16 @@ Experten nach f16 entpackt und Gate/Up, SwiGLU und Down als Tensor-Core-GEMMs re
 1300 tok/s.  Kleinere Abschnitte (Agenten-Schritte) rechnet weiter der CPU-Pool.  Dichte Produkte ab 64 Zeilen laufen
 ebenfalls als f16-GEMM (`--pf-gemm`).  Schalter: `--pf-stream 0|1`, `--pf-min N`, `--pf-ring N`, `--chunk N`.
 
+**Prompt-Attention pro Kopf (`--pf-attn fa`, in Erprobung).** Bei langem Kontext dominiert beim Prompt-Lesen die
+Attention: der bisherige Weg (`gemm`) rechnet sie absorbiert (320/256 breite Zeilen) mit cuBLAS und schreibt dabei eine
+Score-Matrix in f32 in den Speicher. `fa` rechnet pro Kopf (q·k 128, v 128 breit - 2,25× weniger Produkte), Schlüssel
+und Werte eines Abschnitts per f16-GEMM aus dem latenten Cache entpackt, in einem Kernel mit Online-Softmax auf den
+Tensor-Kernen; die Scores verlassen den Multiprozessor nicht. `strata-m4 --selftest-attn` prüft ihn gegen eine
+Referenz und misst beide Wege pro Schicht bei 4k–64k Kontext.
+
+Jede Anfrage schreibt eine Zeile ins Log (`strata-m4 logs`): Prompt-Länge, davon aus dem Cache, gelesen in s und tok/s,
+ob gestreamt (GiB) oder auf der CPU, Antwort-Tempo. `strata-m4 status` zeigt das letzte Prompt-Lesen.
+
 ## Der Befehl `strata-m4`
 
 `install.sh` legt `~/.local/bin/strata-m4` an (wie Stratas `strata`):
@@ -121,6 +131,14 @@ ebenfalls als f16-GEMM (`--pf-gemm`).  Schalter: `--pf-stream 0|1`, `--pf-min N`
 | `strata-m4 bench \| speed \| sanity \| parity \| longctx` | Messskripte (nur bei gestopptem Server) |
 
 Beispiele: `strata-m4 config args add --chunk 4096`, `strata-m4 config set M4_PORT 8095`, danach `strata-m4 restart`.
+
+## Antwortlänge und Tool-Calls
+
+Schickt ein Client kein `max_tokens`, darf die Antwort den Rest des Kontexts nutzen (höchstens 32768 Tokens;
+`--max-tokens N` setzt eine feste Grenze). Tool-Calls (`[TOOL_CALLS]name[ARGS]{json}`) werden robust gelesen: Text nach
+dem JSON wird ignoriert, ein zweiter Call ohne `[TOOL_CALLS]` erkannt, und hat das Modell die Antwort selbst beendet,
+werden fehlende schließende Klammern ergänzt (nie bei abgeschnittenen Antworten). Was trotzdem nicht lesbar ist, bleibt
+Text und steht mit Grund im Log (`tool call not parsed`).
 
 ## Mehrere Gespräche gleichzeitig (`--parallel N`, vorbereitet, noch ungetestet)
 

@@ -287,6 +287,11 @@ def cmd_status(a, env) -> int:
           f"timeouts {w.get('queue_timeouts')}")
     print(f"  rates      answer {r.get('answer_tok_s')} tok/s, prompt {r.get('prefill_tok_s')} tok/s, "
           f"{t.get('totals', {}).get('requests')} requests, {t.get('totals', {}).get('output_tokens')} tokens out")
+    lp = (t.get("m4") or {}).get("last_prompt")
+    if lp:
+        how = f"{lp.get('streamed_gib')} GiB of experts streamed" if lp.get("streamed_gib") else "experts on the CPU"
+        print(f"  last read  {lp.get('read')} tokens ({lp.get('cached')} cached) in {lp.get('s')} s = {lp.get('tok_s')} tok/s, "
+              f"{how}")
     print(f"  gpu        {dev.get('name')}  {fmt_gib(dev.get('mem_used'))}/{fmt_gib(dev.get('mem_total'))} GiB  "
           f"{dev.get('util')} %  {dev.get('temp')} C  {dev.get('power')} W")
     ram = t.get("ram", {})

@@ -124,6 +124,7 @@ struct Options {
     // 256 rows that each conversation takes as it grows (--ctx is the pool, not a per-slot limit)
     int parallel = 1, pf_interleave = 1024;
     bool pf_gemm = true, chunk_set = false;
+    bool pf_fa = false;   // prompt attention per head in one fused kernel (--pf-attn fa) instead of the absorbed GEMMs
     double vram_reserve = 1.5, vram_experts = -1, ram_gpu_node = -1, ram_other_node = -1;
     std::string eagle;            // EAGLE draft head: Mistral's consolidated.safetensors (or its folder)
     int eagle_k = 3;              // drafts per window at most (Mistral recommends 3)
@@ -156,6 +157,8 @@ void usage() {
                  "  --pf-interleave N        parallel: a prompt is read in chunks of at most N tokens while others decode\n"
                  "                           (default 1024)\n"
                  "  --pf-gemm 0|1            prompt chunks of 64+ tokens: dense products as f16 tensor-core GEMMs (default 1)\n"
+                 "  --pf-attn fa|gemm        prompt attention: fa = per head, fused (online softmax on the tensor cores, no\n"
+                 "                           score matrix; 2.25x fewer products), gemm = absorbed, cuBLAS (default gemm)\n"
                  "  --spec N                 n-gram draft tokens per window, 0 = off (default 6, max 15)\n"
                  "  --vram-reserve GiB       VRAM left free (default 1.5)\n"
                  "  --vram-experts GiB       cap on VRAM expert slots (default: all that is left)\n"
@@ -207,6 +210,11 @@ Options parse(int argc, char** argv) {
         else if (a == "--pf-min") o.pf_min = std::stoi(next());
         else if (a == "--pf-ring") o.pf_ring = std::stoi(next());
         else if (a == "--pf-gemm") o.pf_gemm = std::stoi(next()) != 0;
+        else if (a == "--pf-attn") {
+            const std::string v = next();
+            if (v != "fa" && v != "gemm") fail("--pf-attn takes fa or gemm");
+            o.pf_fa = v == "fa";
+        }
         else if (a == "--parallel") o.parallel = std::stoi(next());
         else if (a == "--pf-interleave") o.pf_interleave = std::stoi(next());
         else if (a == "--spec") o.spec = std::stoi(next());
@@ -269,10 +277,41 @@ struct Mat {
     size_t bytes() const { return f ? (size_t) n_in * n_out * 4 : K::native_mmvq_weight_bytes(type, n_in, n_out); }
 };
 
+/// Prompt attention per head (--pf-attn fa): T queries at positions pos0 .. pos0+T-1 over the n_kv = pos0 + T latent
+/// rows K16 [n_kv][320] f16.  q: [T][H][128] (q_nope first), Qf: the absorbed queries' rope part (mla_q_rope's).
+/// Keys and values per head, nb_max keys at a time, in KV (2 x nb_max x H x 128 halves); Oacc [T][H][128] and ML
+/// [T][H][2] carry the softmax state between those passes; the result goes to out [T][H * 128] (the wv_b product
+/// included: what the absorbed route gets after wv_b).
+void prefill_attn_fa(cublasHandle_t cb, cudaStream_t s, const float* q, const float* Qf, const int32_t* pos,
+                     const __half* K16, int T, int H, int pos0, int kv_lora, float kq_scale, float ts, float tf,
+                     const __half* wk16, const __half* wv16, __half* Qm, __half* KV, int nb_max, float* Oacc, float* ML,
+                     float* out) {
+    const float one = 1.f, zero = 0.f;
+    const int n_kv = pos0 + T;
+    m4k::mla_q_mha(q, Qf, pos, T, H, kq_scale * 1.4426950408889634f, ts, tf, Qm, s);
+    __half* Kh = KV;
+    __half* Vh = KV + (size_t) nb_max * H * 128;
+    for (int kb0 = 0; kb0 < n_kv; kb0 += nb_max) {
+        const int nb = std::min(nb_max, n_kv - kb0);
+        const __half* B = K16 + (size_t) kb0 * m4k::kKD;   // latent rows as columns (256 used of 320)
+        // k_nope per head: [64 x 256] (wk_b, column-major) . latent -> Kh[n][h][0:64]
+        CB(cublasGemmStridedBatchedEx(cb, CUBLAS_OP_N, CUBLAS_OP_N, 64, nb, kv_lora, &one, wk16, CUDA_R_16F, 64,
+                                      (long long) 64 * kv_lora, B, CUDA_R_16F, m4k::kKD, 0, &zero, Kh, CUDA_R_16F, H * 128,
+                                      128, H, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+        // v per head: wv_b [128 x 256] . latent -> Vh[n][h][0:128]
+        CB(cublasGemmStridedBatchedEx(cb, CUBLAS_OP_T, CUBLAS_OP_N, 128, nb, kv_lora, &one, wv16, CUDA_R_16F, kv_lora,
+                                      (long long) 128 * kv_lora, B, CUDA_R_16F, m4k::kKD, 0, &zero, Vh, CUDA_R_16F, H * 128,
+                                      128, H, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+        m4k::mla_k_rope_bcast(B, nb, H, Kh, s);
+        m4k::mla_fa_prefill(Qm, Kh, Vh, T, H, pos0, kb0, nb, kb0 == 0, kb0 + nb >= n_kv, Oacc, ML, out, s);
+    }
+}
+
 struct Layer {
     float *attn_norm = nullptr, *q_a_norm = nullptr, *kv_a_norm = nullptr, *ffn_norm = nullptr;
     Mat wq_a, wq_b, wkv_a, wo;
     float *wk_b = nullptr, *wv_b = nullptr;   // f32 [h][kv_lora][nope], [h][v_dim][kv_lora]
+    __half *wk16 = nullptr, *wv16 = nullptr;  // f16 copies (--pf-attn fa: the keys and values of a prompt per head)
     bool dense = false;
     Mat ffn_gate, ffn_up, ffn_down;           // the leading dense layers (none in Mistral Small 4)
     float* router = nullptr;                  // f32 [n_expert][n_embd]
@@ -479,7 +518,7 @@ public:
     struct GenStats {
         int n_prompt = 0, n_reused = 0, n_gen = 0, drafted = 0, accepted = 0, windows = 0, e_drafted = 0,
             e_accepted = 0, e_windows = 0;
-        double prompt_ms = 0, gen_ms = 0;
+        double prompt_ms = 0, gen_ms = 0, streamed_gib = 0;   // streamed: experts sent to the GPU for the prompt
         std::string finish = "length";
     };
     struct GenHooks {   // optional live reports (the serve protocol's PP and W lines)
@@ -505,6 +544,10 @@ private:
     void place_experts();
     // forward
     void mm(const Mat& m, const float* x, const void* xq, float* y, int T, cudaStream_t s);
+    size_t f16_mla(Layer& L);
+    bool fa_ok(const Layer& L) const {
+        return L.wk16 && !dbg_on_ && hp_.nope == 64 && hp_.rope == 64 && hp_.v_dim == 128;
+    }
     void attention(Layer& L, int T, bool window, int pos0, const int32_t* pos = nullptr, float temp_scale = -1.f,
                    float temp_floor = 0.f);
     void moe_window(int l, int T);
@@ -805,6 +848,7 @@ void Engine::load_layers() {
             if (!kb || !vb) fail(n("attn_k_b / attn_v_b") + " missing (a GGUF converted before the MLA split; re-convert)");
             L.wk_b = upload(host_f32(*kb, tensor_ptr(*gm_, kb)));   // {nope, kv_lora, H}: per head [kv_lora][nope]
             L.wv_b = upload(host_f32(*vb, tensor_ptr(*gm_, vb)));   // {kv_lora, v_dim, H}: per head [v_dim][kv_lora]
+            dense_bytes += f16_mla(L);
         }
         dense_bytes += L.wq_a.bytes() + L.wq_b.bytes() + L.wkv_a.bytes() + L.wo.bytes();
         if (l < hp_.dense_lead) {
@@ -1487,13 +1531,20 @@ void Engine::attention(Layer& L, int T, bool window, int pos0, const int32_t* po
         CK(cudaFree(tmp));
     }
     const float one = 1.f, zero = 0.f;
+    const bool fa = !window && fa_ok(L);   // a prompt chunk, per head (prefill_attn_fa)
     // q_nope absorbed through wk_b: per head [kv_lora x nope] . q_nope -> Qf[t][h][0:256]
+    if (!fa)
     CB(cublasSgemmStridedBatched(cb_, CUBLAS_OP_T, CUBLAS_OP_N, hp_.kv_lora, T, hp_.nope, &one, L.wk_b, hp_.nope,
                                  (long long) hp_.kv_lora * hp_.nope, q_, H * 128, 128, &zero, Qf_, H * m4k::kKD, m4k::kKD, H));
     m4k::mla_q_rope(q_, Qf_, rope_, P, T, H, ts, tf, s_);
     dbg("Qcur[absorbed|q_pe]", li, Qf_, T * H, m4k::kKD);
     if (window && !opt_.attn_gemm) {
         m4k::mla_attn_decode(Qf_, L.kv, L.kv_s, opt_.kv, P, T, H, hp_.kq_scale, part_, Olat_, s_, opt_.attn_impl, kvm_);
+    } else if (fa) {
+        m4k::mla_cache_to_f16(L.kv, L.kv_s, opt_.kv, pos0 + T, K16_, s_, kvm_);
+        const int nb_max = (int) std::min<size_t>(8192, S_floats_ * 4 / ((size_t) H * 128 * 2 * 2)) / 32 * 32;
+        prefill_attn_fa(cb_, s_, q_, Qf_, P, K16_, T, H, pos0, hp_.kv_lora, hp_.kq_scale, ts, tf, L.wk16, L.wv16, Q16_,
+                        reinterpret_cast<__half*>(S_), nb_max, Olat_, reinterpret_cast<float*>(P_), attn_);
     } else {
         // prompt chunk at positions pos0 .. pos0+T-1: K rows 0 .. pos0+T-1 as f16, S = K^T Q, causal softmax, O = V P
         const int n_kv = pos0 + T;
@@ -1512,7 +1563,8 @@ void Engine::attention(Layer& L, int T, bool window, int pos0, const int32_t* po
                             CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
         }
     }
-    // per head: wv_b [v_dim x kv_lora] . O -> attn[t][h*v_dim ..]
+    // per head: wv_b [v_dim x kv_lora] . O -> attn[t][h*v_dim ..]   (the fa route wrote attn_ itself)
+    if (!fa)
     CB(cublasSgemmStridedBatched(cb_, CUBLAS_OP_T, CUBLAS_OP_N, hp_.v_dim, T, hp_.kv_lora, &one, L.wv_b, hp_.kv_lora,
                                  (long long) hp_.v_dim * hp_.kv_lora, Olat_, H * m4k::kLat, m4k::kLat, &zero, attn_,
                                  H * hp_.v_dim, hp_.v_dim, H));
@@ -1919,7 +1971,7 @@ void Engine::load_eagle() {
                 }
             L.wk_b = upload(kb);
             L.wv_b = upload(vb);
-            bytes += (kb.size() + vb.size()) * 4;
+            bytes += (kb.size() + vb.size()) * 4 + f16_mla(L);
         }
         L.dense = true;
         L.ffn_gate = mat(p + "feed_forward.w1.weight", E, e_ff_);
@@ -2245,6 +2297,18 @@ void Engine::launch_window(int T) {
     }
 }
 
+/// --pf-attn fa: f16 copies of the layer's wk_b and wv_b (same layouts) -> bytes
+size_t Engine::f16_mla(Layer& L) {
+    if (!opt_.pf_fa || hp_.nope != 64 || hp_.rope != 64 || hp_.v_dim != 128) return 0;
+    const size_t nk = (size_t) hp_.n_head * hp_.kv_lora * hp_.nope, nv = (size_t) hp_.n_head * hp_.v_dim * hp_.kv_lora;
+    CK(cudaMalloc(&L.wk16, nk * 2));
+    CK(cudaMalloc(&L.wv16, nv * 2));
+    m4k::f32_to_f16_scaled(L.wk_b, L.wk16, nk, 1.f, nullptr);
+    m4k::f32_to_f16_scaled(L.wv_b, L.wv16, nv, 1.f, nullptr);
+    CK(cudaDeviceSynchronize());
+    return (nk + nv) * 2;
+}
+
 // ------------------------------------------------------------------------------------------------ KV pages (parallel)
 /// The slot's table entries [from, its page count) to the GPU.  Rare (once per 256 tokens of a conversation), so the
 /// copy waits: the pinned entries may change right after.
@@ -2518,6 +2582,7 @@ Engine::GenStats Engine::generate(const std::vector<int32_t>& prompt, const GenP
     }
     CK(cudaStreamSynchronize(s_));
     st.prompt_ms = ms_since(tp);
+    st.streamed_gib = (pf_stream_bytes_ - streamed0) / GiB;
     if (opt_.mode != "serve")
         logf_("prompt: %d tokens (%d reused) in %.0f ms, %.1f GiB of experts streamed", n, reuse, st.prompt_ms,
               (pf_stream_bytes_ - streamed0) / GiB);
@@ -2774,7 +2839,8 @@ int serve(Engine& eng) {
             json d{{"n_prompt", st.n_prompt}, {"n_reused", st.n_reused}, {"n_gen", st.n_gen},
                    {"prompt_ms", st.prompt_ms}, {"gen_ms", st.gen_ms}, {"drafted", st.drafted},
                    {"accepted", st.accepted}, {"windows", st.windows}, {"eagle_drafted", st.e_drafted},
-                   {"eagle_accepted", st.e_accepted}, {"eagle_windows", st.e_windows}, {"finish", st.finish}};
+                   {"eagle_accepted", st.e_accepted}, {"eagle_windows", st.e_windows}, {"finish", st.finish},
+                   {"streamed_gib", std::round(st.streamed_gib * 100) / 100}};
             out_line("DONE " + d.dump());
             if (ms_since(last_heat) > 300000) {
                 eng.save_heat();
@@ -2869,7 +2935,7 @@ int Engine::serve_parallel() {
                {"prompt_ms", st.prompt_ms}, {"gen_ms", st.gen_ms}, {"drafted", st.drafted},
                {"accepted", st.accepted}, {"windows", st.windows}, {"eagle_drafted", st.e_drafted},
                {"eagle_accepted", st.e_accepted}, {"eagle_windows", st.e_windows}, {"finish", st.finish},
-               {"slot", r.slot}};
+               {"slot", r.slot}, {"streamed_gib", std::round(st.streamed_gib * 100) / 100}};
         out_line("DONE " + r.id + " " + d.dump());
     };
     auto start_decode = [&](Req& r) {
@@ -2940,6 +3006,7 @@ int Engine::serve_parallel() {
             return;
         }
         const bool win = T <= kMaxWin && !(r.gp.embd.is_array() && !r.gp.embd.empty());
+        const double streamed0 = pf_stream_bytes_;
         if (win) {
             int32_t pos[kMaxWin], sl_of[kMaxWin];
             for (int i = 0; i < T; ++i) { pos[i] = r.a + i; sl_of[i] = r.slot; }
@@ -2956,6 +3023,7 @@ int Engine::serve_parallel() {
         }
         r.a += T;
         CK(cudaStreamSynchronize(s_));
+        r.st.streamed_gib += (pf_stream_bytes_ - streamed0) / GiB;
         out_line("PP " + r.id + " " + std::to_string(r.a - r.st.n_reused) + " " +
                  std::to_string(n - 1 - r.st.n_reused) + " " + std::to_string(r.st.n_reused));
         if (r.a >= n - 1) start_decode(r);
@@ -3370,6 +3438,209 @@ int selftest_paged(cudaStream_t s) {
 // ------------------------------------------------------------------------------------------------ attention self-test
 // Random queries and a random latent cache; the split-K decode kernel and the cuBLAS route against a CPU reference
 // in double.  No model needed.
+// --pf-attn fa: the per-head prompt attention against a double reference (per head, from the f16 latent rows and the
+// f16 weights it uses) - prompt chunks at several positions, keys in several passes, rows that fill no tile, the
+// attention temperature - then its speed against the absorbed GEMM route at long contexts (one layer, 4096 queries).
+int selftest_fa(cudaStream_t s, cublasHandle_t cb) {
+    const int D = m4k::kKD, LAT = m4k::kLat, C = 256;
+    const float kq = 0.19497f;
+    std::mt19937 rng(23);
+    std::normal_distribution<float> nd(0.f, 1.f);
+    int fails = 0;
+    struct Case { int H, T, pos0, nb; float ts; };
+    for (const Case& k : {Case{8, 150, 300, 128, 0.f}, Case{8, 150, 300, 8192, 0.f}, Case{8, 70, 0, 8192, 0.f},
+                          Case{4, 33, 1000, 96, 0.f}, Case{8, 100, 40, 64, 0.f}, Case{8, 120, 500, 160, 0.1f}}) {
+        const int H = k.H, T = k.T, pos0 = k.pos0, n_kv = pos0 + T;
+        const float ts = k.ts, tf = ts != 0.f ? 128.f : 8192.f;   // small floor: the factor really changes
+        std::vector<__half> lat((size_t) n_kv * D);
+        for (int n = 0; n < n_kv; ++n)
+            for (int d = 0; d < D; ++d) lat[(size_t) n * D + d] = __float2half(nd(rng) * (d < LAT ? 0.7f : 1.f));
+        std::vector<__half> wk((size_t) H * C * 64), wv((size_t) H * 128 * C);
+        for (auto& v : wk) v = __float2half(nd(rng) * 0.08f);
+        for (auto& v : wv) v = __float2half(nd(rng) * 0.08f);
+        std::vector<float> q((size_t) T * H * 128), Qf((size_t) T * H * D, 0.f);
+        for (auto& v : q) v = nd(rng);
+        for (int t = 0; t < T; ++t)
+            for (int h = 0; h < H; ++h)
+                for (int d = 0; d < 64; ++d) Qf[((size_t) t * H + h) * D + LAT + d] = nd(rng);
+        // reference: k = [wk . c | k_pe], v = wv . c, per head; scores x kq (the temperature on q_nope; mla_q_rope has
+        // already scaled q_pe)
+        auto L = [&](int n, int c) { return (double) __half2float(lat[(size_t) n * D + c]); };
+        std::vector<double> kn((size_t) n_kv * H * 64), vv((size_t) n_kv * H * 128);
+        for (int n = 0; n < n_kv; ++n)
+            for (int h = 0; h < H; ++h) {
+                for (int j = 0; j < 64; ++j) {
+                    double a = 0;
+                    for (int c = 0; c < C; ++c) a += (double) __half2float(wk[((size_t) h * C + c) * 64 + j]) * L(n, c);
+                    kn[((size_t) n * H + h) * 64 + j] = a;
+                }
+                for (int e = 0; e < 128; ++e) {
+                    double a = 0;
+                    for (int c = 0; c < C; ++c) a += (double) __half2float(wv[((size_t) h * 128 + e) * C + c]) * L(n, c);
+                    vv[((size_t) n * H + h) * 128 + e] = a;
+                }
+            }
+        std::vector<double> ref((size_t) T * H * 128);
+        double mag = 0;
+        std::vector<double> sc((size_t) n_kv);
+        for (int t = 0; t < T; ++t) {
+            const int p = pos0 + t;
+            const double tsc = ts != 0.f ? std::log(std::floor(p / (double) tf) + 1.0) * ts + 1.0 : 1.0;
+            for (int h = 0; h < H; ++h) {
+                double m = -1e300;
+                for (int n = 0; n <= p; ++n) {
+                    double a = 0;
+                    for (int j = 0; j < 64; ++j) a += q[((size_t) t * H + h) * 128 + j] * tsc * kn[((size_t) n * H + h) * 64 + j];
+                    for (int d = 0; d < 64; ++d) a += Qf[((size_t) t * H + h) * D + LAT + d] * L(n, LAT + d);
+                    sc[(size_t) n] = a * kq;
+                    m = std::max(m, sc[(size_t) n]);
+                }
+                double l = 0;
+                for (int n = 0; n <= p; ++n) l += (sc[(size_t) n] = std::exp(sc[(size_t) n] - m));
+                for (int e = 0; e < 128; ++e) {
+                    double o = 0;
+                    for (int n = 0; n <= p; ++n) o += sc[(size_t) n] * vv[((size_t) n * H + h) * 128 + e];
+                    ref[((size_t) t * H + h) * 128 + e] = o / l;
+                    mag = std::max(mag, std::fabs(o / l));
+                }
+            }
+        }
+        // device
+        __half *dlat, *dwk, *dwv, *Qm, *KV;
+        float *dq, *dQf, *Oacc, *ML, *out;
+        int32_t* dpos;
+        CK(cudaMalloc(&dlat, lat.size() * 2));
+        CK(cudaMemcpy(dlat, lat.data(), lat.size() * 2, cudaMemcpyHostToDevice));
+        CK(cudaMalloc(&dwk, wk.size() * 2));
+        CK(cudaMemcpy(dwk, wk.data(), wk.size() * 2, cudaMemcpyHostToDevice));
+        CK(cudaMalloc(&dwv, wv.size() * 2));
+        CK(cudaMemcpy(dwv, wv.data(), wv.size() * 2, cudaMemcpyHostToDevice));
+        CK(cudaMalloc(&dq, q.size() * 4));
+        CK(cudaMemcpy(dq, q.data(), q.size() * 4, cudaMemcpyHostToDevice));
+        CK(cudaMalloc(&dQf, Qf.size() * 4));
+        CK(cudaMemcpy(dQf, Qf.data(), Qf.size() * 4, cudaMemcpyHostToDevice));
+        std::vector<int32_t> pos((size_t) T);
+        for (int t = 0; t < T; ++t) pos[(size_t) t] = pos0 + t;
+        CK(cudaMalloc(&dpos, (size_t) T * 4));
+        CK(cudaMemcpy(dpos, pos.data(), (size_t) T * 4, cudaMemcpyHostToDevice));
+        const int nb = std::min(k.nb, n_kv);
+        CK(cudaMalloc(&Qm, (size_t) T * H * 128 * 2));
+        CK(cudaMalloc(&KV, (size_t) 2 * nb * H * 128 * 2));
+        CK(cudaMalloc(&Oacc, (size_t) T * H * 128 * 4));
+        CK(cudaMalloc(&ML, (size_t) T * H * 2 * 4));
+        CK(cudaMalloc(&out, (size_t) T * H * 128 * 4));
+        CK(cudaMemset(Oacc, 0x7f, (size_t) T * H * 128 * 4));   // poison: state that is read before it is written shows
+        CK(cudaMemset(out, 0x7f, (size_t) T * H * 128 * 4));
+        prefill_attn_fa(cb, s, dq, dQf, dpos, dlat, T, H, pos0, C, kq, ts, tf, dwk, dwv, Qm, KV, nb, Oacc, ML, out);
+        CK(cudaStreamSynchronize(s));
+        std::vector<float> o((size_t) T * H * 128);
+        CK(cudaMemcpy(o.data(), out, o.size() * 4, cudaMemcpyDeviceToHost));
+        double e = 0;
+        int wt = 0;
+        for (size_t i = 0; i < o.size(); ++i) {
+            const double d = std::fabs(o[i] - ref[i]);
+            if (!(d <= e)) { e = d; wt = (int) (i / ((size_t) H * 128)); }
+        }
+        const bool ok = e <= 0.01 * mag + 1e-4;
+        fails += !ok;
+        std::printf("prompt attention per head (fa): H=%d T=%3d at %4d, keys in passes of %4d%s: |ref|max %.4f err %.2e %s"
+                    " (worst row %d)\n", H, T, pos0, nb, ts != 0.f ? ", temperature" : "", mag, e, ok ? "ok" : "FAIL", wt);
+        for (void* p : {(void*) dlat, (void*) dwk, (void*) dwv, (void*) dq, (void*) dQf, (void*) dpos, (void*) Qm, (void*) KV,
+                        (void*) Oacc, (void*) ML, (void*) out})
+            CK(cudaFree(p));
+    }
+    // speed: one layer, 4096 queries, 32 heads, the latent rows already f16 (both routes start there)
+    {
+        const int H = 32, T = 4096, NBM = 8192;
+        const size_t s_floats = (size_t) 32 << 20;   // the engine's score buffer (S_floats_ at --ctx <= 1M)
+        const int nmax = 65536;
+        __half *lat, *wk, *wv, *Qm, *Q16, *P16;
+        float *q, *Qf, *Oacc, *out, *S, *wkf, *wvf;
+        int32_t* dpos;
+        CK(cudaMalloc(&lat, (size_t) nmax * D * 2));
+        CK(cudaMalloc(&wk, (size_t) H * C * 64 * 2));
+        CK(cudaMalloc(&wv, (size_t) H * 128 * C * 2));
+        CK(cudaMalloc(&wkf, (size_t) H * C * 64 * 4));
+        CK(cudaMalloc(&wvf, (size_t) H * 128 * C * 4));
+        CK(cudaMalloc(&q, (size_t) T * H * 128 * 4));
+        CK(cudaMalloc(&Qf, (size_t) T * H * D * 4));
+        CK(cudaMalloc(&Qm, (size_t) T * H * 128 * 2));
+        CK(cudaMalloc(&Q16, (size_t) T * H * D * 2));
+        CK(cudaMalloc(&S, s_floats * 4));
+        CK(cudaMalloc(&P16, s_floats * 2));
+        CK(cudaMalloc(&Oacc, (size_t) T * H * LAT * 4));
+        CK(cudaMalloc(&out, (size_t) T * H * 128 * 4));
+        CK(cudaMalloc(&dpos, (size_t) T * 4));
+        {   // modest random data (speed only)
+            std::vector<__half> h16((size_t) nmax * D);
+            for (auto& v : h16) v = __float2half(nd(rng) * 0.5f);
+            CK(cudaMemcpy(lat, h16.data(), h16.size() * 2, cudaMemcpyHostToDevice));
+            std::vector<float> f((size_t) T * H * D);
+            for (auto& v : f) v = nd(rng) * 0.1f;
+            CK(cudaMemcpy(Qf, f.data(), f.size() * 4, cudaMemcpyHostToDevice));
+            CK(cudaMemcpy(q, f.data(), (size_t) T * H * 128 * 4, cudaMemcpyHostToDevice));
+            CK(cudaMemcpy(wkf, f.data(), (size_t) H * C * 64 * 4, cudaMemcpyHostToDevice));
+            CK(cudaMemcpy(wvf, f.data(), (size_t) H * 128 * C * 4, cudaMemcpyHostToDevice));
+            m4k::f32_to_f16_scaled(wkf, wk, (size_t) H * C * 64, 1.f, s);
+            m4k::f32_to_f16_scaled(wvf, wv, (size_t) H * 128 * C, 1.f, s);
+        }
+        const float one = 1.f, zero = 0.f;
+        cudaEvent_t e0, e1;
+        CK(cudaEventCreate(&e0));
+        CK(cudaEventCreate(&e1));
+        for (int n_kv : {4096, 16384, 32768, 65536}) {
+            const int pos0 = n_kv - T;
+            std::vector<int32_t> pos((size_t) T);
+            for (int t = 0; t < T; ++t) pos[(size_t) t] = pos0 + t;
+            CK(cudaMemcpy(dpos, pos.data(), (size_t) T * 4, cudaMemcpyHostToDevice));
+            auto gemm_route = [&]() {   // as attention() runs it without --pf-attn fa
+                CB(cublasSgemmStridedBatched(cb, CUBLAS_OP_T, CUBLAS_OP_N, C, T, 64, &one, wkf, 64, (long long) C * 64, q,
+                                             H * 128, 128, &zero, Qf, H * D, D, H));
+                m4k::f32_to_f16_scaled(Qf, Q16, (size_t) T * H * D, kq, s);
+                const int per = std::max(1, (int) std::min<size_t>((size_t) T, s_floats / ((size_t) n_kv * H)));
+                for (int a = 0; a < T; a += per) {
+                    const int b = std::min(T, a + per), cols = (b - a) * H, m = pos0 + b;
+                    CB(cublasGemmEx(cb, CUBLAS_OP_T, CUBLAS_OP_N, m, cols, D, &one, lat, CUDA_R_16F, D, Q16 + (size_t) a * H * D,
+                                    CUDA_R_16F, D, &zero, S, CUDA_R_32F, m, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+                    m4k::mla_softmax_causal(S, P16, m, cols, H, pos0 + a, s);
+                    CB(cublasGemmEx(cb, CUBLAS_OP_N, CUBLAS_OP_N, LAT, cols, m, &one, lat, CUDA_R_16F, D, P16, CUDA_R_16F, m,
+                                    &zero, Oacc + (size_t) a * H * LAT, CUDA_R_32F, LAT, CUBLAS_COMPUTE_32F,
+                                    CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+                }
+                CB(cublasSgemmStridedBatched(cb, CUBLAS_OP_T, CUBLAS_OP_N, 128, T, C, &one, wvf, C, (long long) 128 * C, Oacc,
+                                             H * LAT, LAT, &zero, out, H * 128, 128, H));
+            };
+            auto fa_route = [&]() {
+                prefill_attn_fa(cb, s, q, Qf, dpos, lat, T, H, pos0, C, kq, 0.f, 8192.f, wk, wv, Qm,
+                                reinterpret_cast<__half*>(S), NBM, Oacc, reinterpret_cast<float*>(P16), out);
+            };
+            float ms_g = 0, ms_f = 0;
+            for (int rep = 0; rep < 2; ++rep) {   // the first round warms up
+                CK(cudaEventRecord(e0, s));
+                gemm_route();
+                CK(cudaEventRecord(e1, s));
+                CK(cudaEventSynchronize(e1));
+                CK(cudaEventElapsedTime(&ms_g, e0, e1));
+                CK(cudaEventRecord(e0, s));
+                fa_route();
+                CK(cudaEventRecord(e1, s));
+                CK(cudaEventSynchronize(e1));
+                CK(cudaEventElapsedTime(&ms_f, e0, e1));
+            }
+            const double flops = 2.0 * 256 * H * ((double) T * pos0 + (double) T * (T + 1) / 2);   // per head: q.k + p.v
+            std::printf("prompt attention, 4096 queries at %5d..%5d: gemm %7.1f ms, fa %7.1f ms per layer (x36: %5.1f s vs"
+                        " %5.1f s per chunk; fa %4.1f TFLOP/s)\n", pos0, n_kv - 1, ms_g, ms_f, ms_g * 36 / 1000,
+                        ms_f * 36 / 1000, flops / (ms_f / 1000) / 1e12);
+        }
+        CK(cudaEventDestroy(e0));
+        CK(cudaEventDestroy(e1));
+        for (void* p : {(void*) lat, (void*) wk, (void*) wv, (void*) wkf, (void*) wvf, (void*) q, (void*) Qf, (void*) Qm,
+                        (void*) Q16, (void*) S, (void*) P16, (void*) Oacc, (void*) out, (void*) dpos})
+            CK(cudaFree(p));
+    }
+    return fails;
+}
+
 int selftest_attn(int gpu) {
     CK(cudaSetDevice(gpu));
     cudaStream_t s;
@@ -3496,6 +3767,7 @@ int selftest_attn(int gpu) {
         }
     }
     fails += selftest_paged(s);
+    fails += selftest_fa(s, cb);
     // speed at long contexts (int8 cache, random rows): both decode kernels, per layer and per token (36 layers)
     for (int n_kv : {4096, 16384, 32768, 65536}) {
         for (int T : {1, 4}) {

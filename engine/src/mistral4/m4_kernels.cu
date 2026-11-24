@@ -816,6 +816,232 @@ void mla_q_rope(const float* q, float* Qf, const float* rope_tab, const int32_t*
     check("mla_q_rope");
 }
 
+// ------------------------------------------------------------------------------------------------ prompt attention per head
+// Prompts without absorption: per head q = [q_nope (64) | q_pe (64)], k = [wk_b . c (64) | k_pe (64)], v = wv_b . c
+// (128).  2.25x fewer products than the absorbed form (rows 320 / 256 wide), and one fused kernel - online softmax,
+// the scores never leave the SM - instead of a score matrix in memory.
+
+// Qm[t][h][0:64] = q_nope (x the attention temperature), [64:128] = q_pe as mla_q_rope left it in Qf; all x scale
+__global__ void mla_q_mha_kernel(const float* q, const float* Qf, const int32_t* pos, int n_head, float scale,
+                                 float temp_scale, float temp_floor, __half* Qm) {
+    const int t = blockIdx.x, h = blockIdx.y, d = threadIdx.x;   // d < 128
+    const size_t th = (size_t) t * n_head + h;
+    float v;
+    if (d < 64) {
+        v = q[th * 128 + d];
+        if (temp_scale != 0.f) v *= logf(floorf((float) pos[t] / temp_floor) + 1.f) * temp_scale + 1.f;
+    } else {
+        v = Qf[th * kKD + kLat + (d - 64)];
+    }
+    Qm[th * 128 + d] = __float2half(v * scale);
+}
+
+// Kh[n][h][64:128] = the key's rope part (shared by the heads), from the f16 latent rows
+__global__ void mla_k_rope_bcast_kernel(const __half* K16, int n_head, __half* Kh) {
+    const int n = blockIdx.x;
+    const __half2* src = reinterpret_cast<const __half2*>(K16 + (size_t) n * kKD + kLat);
+    for (int i = threadIdx.x; i < n_head * 32; i += blockDim.x) {
+        const int h = i >> 5, w = i & 31;
+        reinterpret_cast<__half2*>(Kh + ((size_t) n * n_head + h) * 128 + 64)[w] = src[w];
+    }
+}
+
+namespace fa {
+constexpr int BQ = 64;          // query rows per block: 4 warps x 16
+constexpr int BK = 32;          // keys per tile
+constexpr int D = 128;          // head width (q.k and v)
+constexpr int LDH = D + 8;      // halves per shared row
+constexpr int LDS = BK + 4;     // floats per score row
+constexpr int LDP = BK + 8;     // halves per P row (aliases the score rows)
+constexpr int NW = 4;
+}  // namespace fa
+
+// grid (ceil(T / 64), n_head), 128 threads.  Block: 64 query rows of one head; warp w: rows 16w .. 16w+15.
+// Per tile of 32 keys: K, V into shared memory; per warp S = Q K^T (16 x 32, tensor cores) into shared memory;
+// online softmax (lanes 2r, 2r+1: row r, 16 keys each; log2 domain - Qm carries log2 e); O = O * alpha + P V with O
+// in registers.  The accumulator layout is unspecified, so each thread learns once which row each of its elements
+// is (rowof) and rescales its own elements.  Keys kb0 .. kb0+nb-1 per launch (Kh, Vh hold just them); between
+// launches O (unnormalized), max and sum wait in Oacc / ML; the last launch writes O / sum to out [T][n_head * 128].
+__global__ void __launch_bounds__(128, 2) mla_fa_prefill_kernel(const __half* __restrict__ Qm, const __half* __restrict__ Kh,
+                                                               const __half* __restrict__ Vh, int T, int n_head, int pos0,
+                                                               int kb0, int nb, int first, int last, float* __restrict__ Oacc,
+                                                               float* __restrict__ ML, float* __restrict__ out) {
+    using namespace nvcuda;
+    using namespace fa;
+    __shared__ __align__(32) __half Qs[BQ * LDH];
+    __shared__ __align__(32) __half Ks[BK * LDH];
+    __shared__ __align__(32) __half Vs[BK * LDH];
+    __shared__ __align__(32) float Sw[NW][16 * LDS];
+    __shared__ float m_s[NW][16], l_s[NW][16], a_s[NW][16];
+    const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+    const int h = blockIdx.y, q0 = blockIdx.x * BQ, r0 = q0 + warp * 16;
+    const size_t rs = (size_t) n_head * D;   // row stride (elements) of Qm, Kh, Vh, Oacc, out
+    for (int i = tid; i < BQ * (D / 8); i += 128) {   // the query tile (rows past T: zeros)
+        const int r = i / (D / 8), c = (i % (D / 8)) * 8;
+        uint4 v = make_uint4(0, 0, 0, 0);
+        if (q0 + r < T) v = *reinterpret_cast<const uint4*>(Qm + (size_t) (q0 + r) * rs + (size_t) h * D + c);
+        *reinterpret_cast<uint4*>(Qs + r * LDH + c) = v;
+    }
+    float* S = Sw[warp];
+    __half* Pw = reinterpret_cast<__half*>(S);
+    using Acc = wmma::fragment<wmma::accumulator, 16, 16, 16, float>;
+    constexpr int NE = Acc::num_elements;
+    int rowof[NE];
+    {
+        for (int i = lane; i < 256; i += 32) S[(i >> 4) * LDS + (i & 15)] = (float) (i >> 4);
+        __syncwarp();
+        Acc probe;
+        wmma::load_matrix_sync(probe, S, LDS, wmma::mem_row_major);
+        #pragma unroll
+        for (int i = 0; i < NE; ++i) rowof[i] = (int) probe.x[i];
+        __syncwarp();
+    }
+    if (lane < 16) {
+        const int t = r0 + lane;
+        float m = kNeg, l = 0.f;
+        if (!first && t < T) {
+            m = ML[((size_t) t * n_head + h) * 2];
+            l = ML[((size_t) t * n_head + h) * 2 + 1];
+        }
+        m_s[warp][lane] = m;
+        l_s[warp][lane] = l;
+    }
+    Acc O[D / 16];
+    #pragma unroll
+    for (int f = 0; f < D / 16; ++f) {
+        if (first) {
+            wmma::fill_fragment(O[f], 0.f);
+            continue;
+        }
+        for (int i = lane; i < 256; i += 32) {   // staged: rows past T read nothing
+            const int r = i >> 4, c = i & 15, t = r0 + r;
+            S[r * LDS + c] = t < T ? Oacc[(size_t) t * rs + (size_t) h * D + f * 16 + c] : 0.f;
+        }
+        __syncwarp();
+        wmma::load_matrix_sync(O[f], S, LDS, wmma::mem_row_major);
+        __syncwarp();
+    }
+    const bool live = r0 < T;
+    const int wlast = pos0 + min(r0 + 16, T) - 1;            // this warp's last query position
+    const int kend = min(kb0 + nb, pos0 + min(q0 + BQ, T));  // keys past the block's last query: none
+    for (int kt = kb0; kt < kend; kt += BK) {
+        __syncthreads();   // the previous tile is used up
+        for (int i = tid; i < BK * (D / 8); i += 128) {
+            const int r = i / (D / 8), c = (i % (D / 8)) * 8;
+            uint4 kv = make_uint4(0, 0, 0, 0), vv = kv;
+            if (kt + r < kb0 + nb) {
+                const size_t o = (size_t) (kt - kb0 + r) * rs + (size_t) h * D + c;
+                kv = *reinterpret_cast<const uint4*>(Kh + o);
+                vv = *reinterpret_cast<const uint4*>(Vh + o);
+            }
+            *reinterpret_cast<uint4*>(Ks + r * LDH + c) = kv;
+            *reinterpret_cast<uint4*>(Vs + r * LDH + c) = vv;
+        }
+        __syncthreads();
+        if (!live || kt > wlast) continue;   // no key of the tile is visible to this warp's rows
+        {
+            wmma::fragment<wmma::matrix_a, 16, 16, 16, __half, wmma::row_major> a;
+            wmma::fragment<wmma::matrix_b, 16, 16, 16, __half, wmma::col_major> b;
+            Acc s0, s1;
+            wmma::fill_fragment(s0, 0.f);
+            wmma::fill_fragment(s1, 0.f);
+            #pragma unroll
+            for (int k = 0; k < D / 16; ++k) {
+                wmma::load_matrix_sync(a, Qs + warp * 16 * LDH + k * 16, LDH);
+                wmma::load_matrix_sync(b, Ks + k * 16, LDH);
+                wmma::mma_sync(s0, a, b, s0);
+                wmma::load_matrix_sync(b, Ks + 16 * LDH + k * 16, LDH);
+                wmma::mma_sync(s1, a, b, s1);
+            }
+            wmma::store_matrix_sync(S, s0, LDS, wmma::mem_row_major);
+            wmma::store_matrix_sync(S + 16, s1, LDS, wmma::mem_row_major);
+        }
+        __syncwarp();
+        {
+            const int r = lane >> 1, hf = lane & 1, t = r0 + r, qpos = pos0 + t;
+            float sv[16];
+            unsigned mk = 0;
+            float mx = kNeg;
+            #pragma unroll
+            for (int c = 0; c < 16; ++c) {
+                const int col = hf * 16 + c, kpos = kt + col;
+                sv[c] = S[r * LDS + col];
+                if (t < T && kpos < kb0 + nb && kpos <= qpos) {
+                    mk |= 1u << c;
+                    mx = fmaxf(mx, sv[c]);
+                }
+            }
+            mx = fmaxf(mx, __shfl_xor_sync(0xffffffffu, mx, 1));
+            const float m_old = m_s[warp][r], m_new = fmaxf(m_old, mx), alpha = exp2f(m_old - m_new);
+            const float l_old = l_s[warp][r];
+            __syncwarp();   // every lane holds its scores (and the row's state) before P and the state change
+            float sum = 0.f;
+            #pragma unroll
+            for (int c = 0; c < 16; ++c) {
+                const float p = (mk >> c & 1u) ? exp2f(sv[c] - m_new) : 0.f;
+                sum += p;
+                Pw[r * LDP + hf * 16 + c] = __float2half(p);
+            }
+            sum += __shfl_xor_sync(0xffffffffu, sum, 1);
+            if (hf == 0) {
+                m_s[warp][r] = m_new;
+                l_s[warp][r] = l_old * alpha + sum;
+                a_s[warp][r] = alpha;
+            }
+        }
+        __syncwarp();
+        float al[NE];
+        #pragma unroll
+        for (int i = 0; i < NE; ++i) al[i] = a_s[warp][rowof[i]];
+        #pragma unroll
+        for (int f = 0; f < D / 16; ++f)
+            #pragma unroll
+            for (int i = 0; i < NE; ++i) O[f].x[i] *= al[i];
+        {
+            wmma::fragment<wmma::matrix_a, 16, 16, 16, __half, wmma::row_major> a;
+            wmma::fragment<wmma::matrix_b, 16, 16, 16, __half, wmma::row_major> b;
+            #pragma unroll
+            for (int k = 0; k < BK / 16; ++k) {
+                wmma::load_matrix_sync(a, Pw + k * 16, LDP);
+                #pragma unroll
+                for (int f = 0; f < D / 16; ++f) {
+                    wmma::load_matrix_sync(b, Vs + k * 16 * LDH + f * 16, LDH);
+                    wmma::mma_sync(O[f], a, b, O[f]);
+                }
+            }
+        }
+        __syncwarp();
+    }
+    if (!live) return;
+    if (last) {
+        float inv[NE];
+        #pragma unroll
+        for (int i = 0; i < NE; ++i) {
+            const float l = l_s[warp][rowof[i]];
+            inv[i] = l > 0.f ? 1.f / l : 0.f;
+        }
+        #pragma unroll
+        for (int f = 0; f < D / 16; ++f)
+            #pragma unroll
+            for (int i = 0; i < NE; ++i) O[f].x[i] *= inv[i];
+    }
+    float* dst = last ? out : Oacc;
+    #pragma unroll
+    for (int f = 0; f < D / 16; ++f) {
+        wmma::store_matrix_sync(S, O[f], LDS, wmma::mem_row_major);
+        __syncwarp();
+        for (int i = lane; i < 256; i += 32) {
+            const int r = i >> 4, c = i & 15, t = r0 + r;
+            if (t < T) dst[(size_t) t * rs + (size_t) h * D + f * 16 + c] = S[r * LDS + c];
+        }
+        __syncwarp();
+    }
+    if (!last && lane < 16 && r0 + lane < T) {
+        ML[((size_t) (r0 + lane) * n_head + h) * 2] = m_s[warp][lane];
+        ML[((size_t) (r0 + lane) * n_head + h) * 2 + 1] = l_s[warp][lane];
+    }
+}
+
 size_t mla_decode_part_floats(int T, int n_head) { return (size_t) T * kAttnChunks * n_head * (kLat + 2); }
 
 void mla_attn_decode(const float* Qf, const void* cache, const float* scales, int kv_mode, const int32_t* pos, int T,
@@ -854,6 +1080,27 @@ void mla_cache_to_f16(const void* cache, const float* scales, int kv_mode, int n
     if (tot == 0) return;
     cache_to_f16_kernel<<<(unsigned) ((tot + 255) / 256), 256, 0, s>>>(cache, scales, kv_mode, n, K16, map);
     check("cache_to_f16");
+}
+
+void mla_q_mha(const float* q, const float* Qf, const int32_t* pos, int T, int n_head, float scale, float temp_scale,
+               float temp_floor, __half* Qm, cudaStream_t s) {
+    if (T <= 0) return;
+    mla_q_mha_kernel<<<dim3(T, n_head), 128, 0, s>>>(q, Qf, pos, n_head, scale, temp_scale, temp_floor, Qm);
+    check("mla_q_mha");
+}
+
+void mla_k_rope_bcast(const __half* K16, int nb, int n_head, __half* Kh, cudaStream_t s) {
+    if (nb <= 0) return;
+    mla_k_rope_bcast_kernel<<<nb, std::min(1024, n_head * 32), 0, s>>>(K16, n_head, Kh);
+    check("mla_k_rope_bcast");
+}
+
+void mla_fa_prefill(const __half* Qm, const __half* Kh, const __half* Vh, int T, int n_head, int pos0, int kb0, int nb,
+                    bool first, bool last, float* Oacc, float* ML, float* out, cudaStream_t s) {
+    if (T <= 0) return;
+    mla_fa_prefill_kernel<<<dim3((T + fa::BQ - 1) / fa::BQ, n_head), 128, 0, s>>>(Qm, Kh, Vh, T, n_head, pos0, kb0, nb,
+                                                                                    first, last, Oacc, ML, out);
+    check("mla_fa_prefill");
 }
 
 void f32_to_f16_scaled(const float* x, __half* y, size_t n, float scale, cudaStream_t s) {

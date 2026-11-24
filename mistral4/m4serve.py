@@ -39,11 +39,6 @@ from mistral_common.protocol.instruct.request import ChatCompletionRequest
 from mistral_common.tokens.tokenizers.base import SpecialTokenPolicy
 from mistral_common.tokens.tokenizers.mistral import MistralTokenizer
 
-try:  # private helpers of mistral-common; the server falls back to plain text when they move
-    from mistral_common.experimental.tools import _decode_tool_calls, _split_content_and_tool_calls
-except Exception:  # pragma: no cover
-    _decode_tool_calls = _split_content_and_tool_calls = None
-
 
 def log(*a):
     print("[m4serve]", *a, file=sys.stderr, flush=True)
@@ -376,7 +371,7 @@ class Chat:
         self.tok = self.mt.instruct_tokenizer.tokenizer
         self.eos = self.tok.eos_id
         self.ids = {}
-        for name in ("[THINK]", "[/THINK]", "[TOOL_CALLS]", "[IMG]", "[IMG_BREAK]", "[IMG_END]"):
+        for name in ("[THINK]", "[/THINK]", "[TOOL_CALLS]", "[ARGS]", "[CALL_ID]", "[IMG]", "[IMG_BREAK]", "[IMG_END]"):
             self.ids[name] = self._special(name)
         log("tokenizer:", tokenizer, "eos", self.eos, {k: v for k, v in self.ids.items()})
 
@@ -459,8 +454,12 @@ class Chat:
             i += 1
         return out, embd
 
-    def split(self, ids: list[int]):
-        """-> (content, reasoning, tool_calls)"""
+    def _dec(self, x: list[int]) -> str:
+        return self.tok.decode(x, special_token_policy=SpecialTokenPolicy.IGNORE) if x else ""
+
+    def split(self, ids: list[int], finish: str | None = None):
+        """-> (content, reasoning, tool_calls).  finish: the engine's reason the answer ended ("stop": the model ended
+        it itself - then a call whose JSON lacks closing brackets is completed)."""
         th, eth, tc = self.ids["[THINK]"], self.ids["[/THINK]"], self.ids["[TOOL_CALLS]"]
         reasoning, rest, inside = [], [], False
         for t in ids:
@@ -473,19 +472,125 @@ class Chat:
             else:
                 rest.append(t)
         calls = []
-        if tc is not None and tc in rest and _split_content_and_tool_calls:
-            content_ids, call_ids = _split_content_and_tool_calls(rest, tc)
+        if tc is not None and tc in rest:
+            i = rest.index(tc)
             try:
-                for c in _decode_tool_calls(call_ids, self.tok):
-                    calls.append({"id": c.id if getattr(c, "id", None) and c.id != "null" else "call_" + uuid.uuid4().hex[:9],
-                                  "type": "function",
-                                  "function": {"name": c.function.name, "arguments": c.function.arguments
-                                               if isinstance(c.function.arguments, str) else json.dumps(c.function.arguments)}})
-                rest = content_ids
-            except Exception as e:  # malformed call: leave it as text
-                log("tool call not parsed:", e)
-        dec = lambda x: self.tok.decode(x, special_token_policy=SpecialTokenPolicy.IGNORE) if x else ""
-        return dec(rest), dec(reasoning), calls
+                calls = self.decode_calls(rest[i:], finish == "stop")
+                rest = rest[:i]
+            except Exception as e:   # malformed call: it stays text (and the log says why)
+                raw = self._dec(rest[i:])
+                log(f"tool call not parsed (answer ended by {finish or '?'}, {len(rest) - i} tokens): {e}; "
+                    f"start {raw[:120]!r} ... end {raw[-160:]!r}")
+                calls = []
+        return self._dec(rest), self._dec(reasoning), calls
+
+    def decode_calls(self, ids: list[int], may_close: bool) -> list[dict]:
+        """[TOOL_CALLS]name([CALL_ID]id)?[ARGS]{json} ... -> OpenAI tool calls.  Tolerates text after a call's JSON
+        (the next call's name when the model left out [TOOL_CALLS]); may_close: the answer's last JSON may lack its
+        closing brackets (the model ended the answer itself - never for a cut-off answer)."""
+        tc, arg, cid = self.ids["[TOOL_CALLS]"], self.ids["[ARGS]"], self.ids.get("[CALL_ID]")
+        groups, cur = [], None
+        for t in ids:
+            if t == tc:
+                cur = []
+                groups.append(cur)
+            elif cur is not None:
+                cur.append(t)
+        calls = []
+
+        def add(name, args, call_id=None):
+            name = name.strip()
+            if not name or not isinstance(args, dict):
+                raise ValueError(f"call {name!r}: arguments are not a JSON object")
+            calls.append({"id": call_id or "call_" + uuid.uuid4().hex[:9], "type": "function",
+                          "function": {"name": name, "arguments": json.dumps(args, ensure_ascii=False)}})
+
+        for gi, g in enumerate(groups):
+            last_group = gi == len(groups) - 1
+            if arg is None or arg not in g:   # the older format: [TOOL_CALLS][{"name": ..., "arguments": {...}}, ...]
+                obj, tail, _ = json_prefix(self._dec(g), may_close and last_group)
+                for c in obj if isinstance(obj, list) else [obj]:
+                    if not isinstance(c, dict):
+                        raise ValueError("a call is not a JSON object")
+                    add(str(c.get("name", "")), c.get("arguments"), c.get("id"))
+                continue
+            segs, cur = [[]], None
+            for t in g:
+                if t == arg:
+                    segs.append([])
+                else:
+                    segs[-1].append(t)
+            head = segs[0]
+            call_id = None
+            if cid is not None and cid in head:
+                k = head.index(cid)
+                call_id, head = self._dec(head[k + 1:]).strip() or None, head[:k]
+            name = self._dec(head)
+            for k, seg in enumerate(segs[1:], 1):
+                last = last_group and k == len(segs) - 1
+                obj, tail, closed = json_prefix(self._dec(seg), may_close and last)
+                if closed:
+                    log(f"tool call {name.strip()!r}: closing brackets added (the model ended without them)")
+                add(name, obj, call_id)
+                name, call_id = tail, None   # text after the JSON: the next call's name
+            if name.strip():
+                log(f"tool call: text after the last call ignored: {name.strip()[:80]!r}")
+        if not calls:
+            raise ValueError("no call found")
+        return calls
+
+
+def request_line(rid: str, st: dict, outcome: str) -> str:
+    """One log line per request: what was read (and how), what was written."""
+    n, reused, gen = int(st.get("n_prompt") or 0), int(st.get("n_reused") or 0), int(st.get("n_gen") or 0)
+    read, pms, gms = n - reused, float(st.get("prompt_ms") or 0), float(st.get("gen_ms") or 0)
+    gib = float(st.get("streamed_gib") or 0)
+    s = f"request {rid[:12]}: prompt {n} tokens ({reused} cached)"
+    if read > 1 and pms > 0:
+        s += f", read {read} in {pms / 1000:.1f} s = {read / (pms / 1000):.0f} tok/s " + \
+             (f"({gib:.1f} GiB of experts streamed)" if gib > 0 else "(experts on the CPU)")
+    if gen:
+        s += f"; answer {gen} tokens" + (f" in {gms / 1000:.1f} s = {gen / (gms / 1000):.1f} tok/s" if gms > 0 else "")
+        if st.get("eagle_windows"):
+            s += f" (eagle {st.get('eagle_accepted', 0)}/{st.get('eagle_drafted', 0)})"
+    if st.get("slot") is not None and int(st.get("slot", -1)) >= 0:
+        s += f"; slot {st['slot']}"
+    return s + f"; {outcome}"
+
+
+def json_prefix(text: str, may_close: bool):
+    """The JSON value at the start of text -> (value, text after it, closed).  may_close: a value that ends early
+    (closing brackets missing, nothing cut inside a string) is completed."""
+    s = text.lstrip()
+    try:
+        obj, end = json.JSONDecoder().raw_decode(s)
+        return obj, s[end:], False
+    except json.JSONDecodeError as e:
+        if not may_close:
+            raise ValueError(f"invalid JSON ({e.msg} at {e.pos} of {len(s)} characters)") from None
+        err = e
+    stack, in_str, esc = [], False, False
+    for ch in s:
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+        elif ch == '"':
+            in_str = True
+        elif ch in "{[":
+            stack.append("}" if ch == "{" else "]")
+        elif ch in "}]":
+            if not stack or stack.pop() != ch:
+                stack = None
+                break
+    if in_str or not stack:
+        raise ValueError(f"invalid JSON ({err.msg} at {err.pos} of {len(s)} characters)")
+    fixed = s.rstrip().rstrip(",") + "".join(reversed(stack))
+    obj, end = json.JSONDecoder().raw_decode(fixed)
+    return obj, "", True
 
 
 # ---------------------------------------------------------------------------------------------- telemetry
@@ -514,6 +619,7 @@ class Telemetry:
         self.rejected = self.timeouts = self.disconnects = 0
         self.last_answer = None
         self.last_prefill = None
+        self.last_prompt: dict | None = None
         self.devices: list[dict] = []
         self.windows = collections.deque(maxlen=512)   # (time, rows, taken) per decode window
         threading.Thread(target=self._sample_gpus, daemon=True).start()
@@ -613,6 +719,9 @@ class Telemetry:
                 read = n_prompt - int(st.get("n_reused", 0))
                 if pms > 0 and read > 16:
                     self.last_prefill = read / (pms / 1000.0)
+                    self.last_prompt = {"read": read, "cached": int(st.get("n_reused", 0)), "s": round(pms / 1000.0, 2),
+                                        "tok_s": round(self.last_prefill, 1),
+                                        "streamed_gib": float(st.get("streamed_gib") or 0)}
 
     # -- hardware
     def _sample_gpus(self):
@@ -700,6 +809,7 @@ class Telemetry:
                 "totals": dict(self.totals),
                 "activity": {"last_seq": self.seq, "events": list(self.events)[-32:]},
                 "quality": {"request_correlation": "reported", "per_device": "reported"},
+                "m4": {"last_prompt": dict(self.last_prompt) if self.last_prompt else None},
             }
 
     def status(self) -> dict:
@@ -763,6 +873,8 @@ def make_handler(S: State):
             return st
         finally:
             S.tele.finished(rid, st, outcome)
+            if st:
+                log(request_line(rid, st, outcome))
 
     class H(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
@@ -792,7 +904,12 @@ def make_handler(S: State):
             if not self._auth():
                 return
             if self.path == "/v1/telemetry":
-                return self._json(200, S.tele.snapshot())
+                t0 = time.time()
+                snap = S.tele.snapshot()
+                self._json(200, snap)
+                if time.time() - t0 > 1.0:   # the monitor gives up after 3 s
+                    log(f"slow telemetry answer: {time.time() - t0:.1f} s")
+                return
             if self.path == "/v1/status":
                 return self._json(200, S.tele.status())
             if self.path == "/v1/models":
@@ -845,7 +962,9 @@ def make_handler(S: State):
         # -- the engine request
         def _gen_req(self, body: dict, ids: list[int], embd, key: str) -> dict:
             d = S.defaults
-            r = {"ids": ids, "max_new": int(body.get("max_tokens") or body.get("max_completion_tokens") or d["max_tokens"]),
+            ctx = int(S.engine.info.get("ctx") or 0)
+            auto = d["max_tokens"] or (max(256, min(32768, ctx - len(ids) - 64)) if ctx else 4096)
+            r = {"ids": ids, "max_new": int(body.get("max_tokens") or body.get("max_completion_tokens") or auto),
                  "temp": float(body.get("temperature", d["temperature"])), "top_p": float(body.get("top_p", d["top_p"])),
                  "top_k": int(body.get("top_k", 0)), "min_p": float(body.get("min_p", 0.0)),
                  "stop_ids": [S.chat.eos], "seed": int(body.get("seed") or 0)}
@@ -873,7 +992,7 @@ def make_handler(S: State):
                     st = run(req, out.extend, lambda: False)
                 except Busy as b:
                     return self._json(b.code, {"error": {"message": b.message, "type": "server_error", "code": "queue_timeout"}})
-                content, reasoning, calls = S.chat.split([t for t in out if t != S.chat.eos])
+                content, reasoning, calls = S.chat.split([t for t in out if t != S.chat.eos], st.get("finish"))
                 msg = {"role": "assistant", "content": content or (None if calls else "")}
                 if reasoning:
                     msg["reasoning_content"] = reasoning
@@ -933,7 +1052,7 @@ def make_handler(S: State):
                 except Exception:
                     pass
                 return
-            content, reasoning, calls = S.chat.split([t for t in out if t != S.chat.eos])
+            content, reasoning, calls = S.chat.split([t for t in out if t != S.chat.eos], st.get("finish"))
             if content.startswith(sent["content"]) and len(content) > len(sent["content"]):
                 chunk({"content": content[len(sent["content"]):]})
             for i, c in enumerate(calls):
@@ -995,7 +1114,8 @@ def main():
                     help="conversations at once (the engine's --parallel; 1-8; overrides one in --engine-args)")
     ap.add_argument("--max-queue", type=int, default=16, help="requests that may wait for the engine (more: 503 at once)")
     ap.add_argument("--queue-timeout", type=float, default=900.0, help="seconds a request may wait for the engine (then 503)")
-    ap.add_argument("--max-tokens", type=int, default=4096)
+    ap.add_argument("--max-tokens", type=int, default=0,
+                    help="answer limit when a request sets none (default 0: the rest of the context, at most 32768)")
     ap.add_argument("--temperature", type=float, default=0.1)
     ap.add_argument("--top-p", type=float, default=1.0)
     a = ap.parse_args()
