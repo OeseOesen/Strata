@@ -1149,12 +1149,15 @@ def main():
     except KeyboardInterrupt:
         pass
     finally:
+        t0 = time.time()
         try:
             S.engine.p.stdin.write("QUIT\n")
             S.engine.p.stdin.flush()
             S.engine.p.wait(timeout=30)
+            log(f"engine ended in {time.time() - t0:.1f} s")
         except Exception:
             S.engine.p.kill()
+            log(f"engine did not end in {time.time() - t0:.0f} s; killed")
 
 
 if __name__ == "__main__":

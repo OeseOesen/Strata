@@ -118,6 +118,12 @@ def engine_pids() -> list[int]:
 
 
 def alive(pid: int) -> bool:
+    try:   # an ended process its parent has not collected yet (a zombie) counts as ended
+        with open(f"/proc/{pid}/stat") as f:
+            if f.read().rsplit(")", 1)[-1].split()[0] in ("Z", "X"):
+                return False
+    except OSError:
+        pass
     try:
         os.kill(pid, 0)
         return True
@@ -203,7 +209,7 @@ def stop(grace: float = 30.0) -> bool:
         except ProcessLookupError:
             pass
     PIDFILE.unlink(missing_ok=True)
-    print("strata-m4: stopped")
+    print(f"strata-m4: stopped ({time.time() - t0:.0f} s)")
     return True
 
 

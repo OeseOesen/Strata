@@ -3833,7 +3833,14 @@ int run(int argc, char** argv) {
     if (o.mode == "selftest-attn") return selftest_attn(o.gpu);
     Engine eng(o);
     eng.load();
-    if (o.mode == "serve") return o.parallel > 1 ? eng.serve_parallel() : serve(eng);
+    if (o.mode == "serve") {
+        // the heat file is written; leave without the destructors and the CUDA runtime's exit work (the driver frees
+        // the context, the 40 GiB of pinned arenas and the GPU memory when the process ends) - stops took 30+ s
+        const int rc = o.parallel > 1 ? eng.serve_parallel() : serve(eng);
+        std::fprintf(stderr, "strata-m4: quit\n");
+        std::fflush(nullptr);
+        std::_Exit(rc);
+    }
     if (o.mode == "eagle-acc") {
         std::ifstream f(o.ids_file);
         std::vector<int32_t> ids;
