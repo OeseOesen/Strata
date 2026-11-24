@@ -122,6 +122,29 @@ ebenfalls als f16-GEMM (`--pf-gemm`).  Schalter: `--pf-stream 0|1`, `--pf-min N`
 
 Beispiele: `strata-m4 config args add --chunk 4096`, `strata-m4 config set M4_PORT 8095`, danach `strata-m4 restart`.
 
+## Mehrere Gespräche gleichzeitig (`--parallel N`, vorbereitet, noch ungetestet)
+
+Standard ist ein Gespräch zur Zeit (`--parallel 1`, unverändert). Mit `--parallel N` (1–8) laufen bis zu N Anfragen
+gleichzeitig, jede in einem Slot mit eigenem Prompt-Cache:
+
+- **Der Kontext wächst mit.** Der latente KV-Cache von `--ctx` Tokens ist ein gemeinsamer Vorrat aus Seiten zu 256
+  Tokens; jedes Gespräch nimmt sich Seiten, während es wächst (eine Seitentabelle je Slot, die Attention-Kernel lesen
+  über sie). Ein einzelnes Gespräch kann also den ganzen Kontext nutzen, vier kurze teilen ihn. Ist der Vorrat leer,
+  geben ruhende Slots Seiten vom Ende ihres Prompt-Caches ab (der Anfang - Systemprompt, ältere Züge - bleibt
+  wiederverwendbar). Gehören alle Seiten laufenden Gesprächen, endet die wachsende Anfrage mit `length`.
+- **Gemeinsame Fenster.** Ein Decode-Fenster enthält das nächste Token (und die Entwürfe) jedes laufenden Gesprächs; die
+  Experten, die es liest, dienen allen. Die 16 Zeilen werden geteilt (bei n Gesprächen 16/n − 1 Entwürfe je Gespräch);
+  der EAGLE-Kopf folgt allen Gesprächen in einem Durchlauf.
+- **Prompts zwischendurch.** Ein neuer Prompt wird in Abschnitten von höchstens `--pf-interleave` Tokens (Standard
+  1024) gelesen, solange andere decodieren.
+- **Slot-Wahl:** der ruhende Slot mit dem längsten passenden Prompt-Anfang (ab 32 Tokens), sonst der am längsten
+  unbenutzte. Ein Agent behält so seinen Cache.
+
+Einstellen: `strata-m4 launch --parallel 4` (nur für diesen Start; auch `restart`/`serve`) oder dauerhaft
+`strata-m4 config set M4_PARALLEL 4`. m4serve nimmt dann `--max-queue` Anfragen zusätzlich an, die auf einen Slot warten;
+der Monitor zeigt alle Slots. Prüfen (Server mit `--parallel` läuft): `python3 ~/strata-m4/parallel_check.py --n 4`
+(gleiche Antworten allein und gleichzeitig, Gesamttempo). Die Seiten-Kernel prüft `strata-m4 --selftest-attn` ohne Modell.
+
 ## Strata Monitor
 
 m4serve liefert Strata's Telemetrie-Schnittstelle (`GET /v1/telemetry`, Schema 1, und `/v1/status`). Der Monitor aus dem

@@ -19,6 +19,23 @@ constexpr int kAttnChunks = 64;     // decode attention: key ranges per query to
 
 enum KvMode : int { KV_I8 = 0, KV_F16 = 1 };
 
+/// Paged latent KV (parallel slots, a context that grows with each conversation): the cache is a pool of pages of
+/// kPage rows; slot s's position p lives in row ptab[s * stride + p / kPage] * kPage + p % kPage.  ptab == nullptr is
+/// the single sequence of before (row = position).  rslot: the slot of each query row t (nullptr: ptab already points
+/// at one slot's table).  kPage is a multiple of the decode kernels' 32-key tiles, so a tile never spans two pages.
+constexpr int kPageBits = 8;
+constexpr int kPage = 1 << kPageBits;
+struct KvMap {
+    const int32_t* ptab = nullptr;
+    int stride = 0;
+    const int32_t* rslot = nullptr;
+};
+__host__ __device__ __forceinline__ size_t kv_row(const KvMap& m, int t, int p) {
+    if (!m.ptab) return (size_t) p;
+    const int32_t* tab = m.ptab + (size_t) (m.rslot ? m.rslot[t] : 0) * (size_t) m.stride;
+    return (size_t) tab[p >> kPageBits] * kPage + (size_t) (p & (kPage - 1));
+}
+
 /// y[r] = x[r] / rms(x[r]) * w, rows of n (x and y may alias); strides in floats.
 void rmsnorm(const float* x, const float* w, float* y, int n, int rows, int x_stride, int y_stride, float eps,
              cudaStream_t s);
@@ -34,7 +51,7 @@ void rope_table_host(float* out, int n_pos, int n_rot, float freq_base, float fr
 ///   kv latent = rmsnorm(kvp[t][0:256]) * kv_a_norm ; k_pe = rope(kvp[t][256:320], pos[t])
 ///   written to the layer's cache row pos[t] (int8 with a scale per half, or f16).
 void mla_kv_write(const float* kvp, const float* kv_norm, const float* rope_tab, const int32_t* pos, int T,
-                  int kv_mode, void* cache, float* scales, float eps, cudaStream_t s);
+                  int kv_mode, void* cache, float* scales, float eps, cudaStream_t s, KvMap map = {});
 /// MLA, step 2: q_pe = rope(q[t][h][64:128]) written to Qf[t][h][256:320]; Qf[t][h][0:256] holds q_nope absorbed
 /// through wk_b (a cuBLAS batched GEMM before this call).  Optional llama-4 style temperature scaling of the whole
 /// row: s = log(floor(pos/floor_scale)+1)*temp_scale + 1 (temp_scale 0 = off; llama.cpp's form).
@@ -48,10 +65,12 @@ size_t mla_decode_part_floats(int T, int n_head);
 /// the plain CUDA-core kernel.
 enum AttnImpl : int { ATTN_SIMT = 0, ATTN_TC = 1 };
 void mla_attn_decode(const float* Qf, const void* cache, const float* scales, int kv_mode, const int32_t* pos, int T,
-                     int n_head, float kq_scale, float* part, float* O, cudaStream_t s, int impl = ATTN_TC);
+                     int n_head, float kq_scale, float* part, float* O, cudaStream_t s, int impl = ATTN_TC,
+                     KvMap map = {});
 /// Prompt path helpers (cuBLAS does the products): the cache rows [0, n) as f16 K rows (ld 320), Qf as f16 scaled by
 /// `scale`, the causal softmax over scores S (column c = token c / n_head; keys <= pos[t]) into f16 P.
-void mla_cache_to_f16(const void* cache, const float* scales, int kv_mode, int n, __half* K16, cudaStream_t s);
+void mla_cache_to_f16(const void* cache, const float* scales, int kv_mode, int n, __half* K16, cudaStream_t s,
+                      KvMap map = {});
 void f32_to_f16_scaled(const float* x, __half* y, size_t n, float scale, cudaStream_t s);
 /// Column c is query token c / n_head of the sub-chunk, at position pos0 + c / n_head: keys beyond it get 0.
 void mla_softmax_causal(const float* S, __half* P, int n_kv, int cols, int n_head, int pos0, cudaStream_t s);

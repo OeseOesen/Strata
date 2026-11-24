@@ -74,11 +74,12 @@ __global__ void add_kernel(float* x, const float* a, size_t n) {
 // ---------------------------------------------------------------------------------------------- MLA
 // one block per token, 256 threads: thread d < 256 owns latent value d; threads < 32 own rope pair d
 __global__ void mla_kv_write_kernel(const float* kvp, const float* kv_norm, const float2* rope_tab, const int32_t* pos,
-                                    int kv_mode, void* cache, float* scales, float eps) {
+                                    int kv_mode, void* cache, float* scales, float eps, KvMap map) {
     __shared__ float red[32];
     const int t = blockIdx.x, d = threadIdx.x;
     const float* r = kvp + (size_t) t * kKD;
     const int p = pos[t];
+    const size_t prow = kv_row(map, t, p);   // the cache row (rope still takes the position)
     const float v = r[d];
     const float ss = block_sum(v * v, red);
     const float lat = v * rsqrtf(ss / (float) kLat + eps) * kv_norm[d];
@@ -90,7 +91,7 @@ __global__ void mla_kv_write_kernel(const float* kvp, const float* kv_norm, cons
         rp = (d & 1) ? (x0 * cs.y + x1 * cs.x) : (x0 * cs.x - x1 * cs.y);
     }
     if (kv_mode == KV_F16) {
-        __half* row = static_cast<__half*>(cache) + (size_t) p * kKD;
+        __half* row = static_cast<__half*>(cache) + prow * kKD;
         row[d] = __float2half(lat);
         if (d < kRope) row[kLat + d] = __float2half(rp);
         return;
@@ -98,12 +99,12 @@ __global__ void mla_kv_write_kernel(const float* kvp, const float* kv_norm, cons
     const float am = block_max(fabsf(lat), red);
     const float ar = block_max(d < kRope ? fabsf(rp) : 0.f, red);
     const float s0 = am > 0.f ? am / 127.f : 1.f, s1 = ar > 0.f ? ar / 127.f : 1.f;
-    int8_t* row = static_cast<int8_t*>(cache) + (size_t) p * kKD;
+    int8_t* row = static_cast<int8_t*>(cache) + prow * kKD;
     row[d] = (int8_t) __float2int_rn(fminf(127.f, fmaxf(-127.f, lat / s0)));
     if (d < kRope) row[kLat + d] = (int8_t) __float2int_rn(fminf(127.f, fmaxf(-127.f, rp / s1)));
     if (d == 0) {
-        scales[(size_t) p * 2 + 0] = s0;
-        scales[(size_t) p * 2 + 1] = s1;
+        scales[prow * 2 + 0] = s0;
+        scales[prow * 2 + 1] = s1;
     }
 }
 
@@ -140,7 +141,7 @@ constexpr float kNeg = -1.0e30f;
 
 __global__ void __launch_bounds__(256) mla_decode_kernel(const float* Qf, const void* cache, const float* scales,
                                                          int kv_mode, const int32_t* pos, int n_head, float kq_scale,
-                                                         float* part) {
+                                                         float* part, KvMap map) {
     __shared__ __half2 q2[kMaxHeads][QW];
     __shared__ __half2 k2[TILE][QW];
     __shared__ float S[kMaxHeads][TILE + 1];
@@ -179,12 +180,13 @@ __global__ void __launch_bounds__(256) mla_decode_kernel(const float* Qf, const 
 
     for (int kt = k0; kt < k1; kt += TILE) {
         const int nk = min(TILE, k1 - kt);   // valid keys in this tile
+        const size_t base = kv_row(map, t, kt);   // the tile's first cache row (a tile stays within one page)
         __syncthreads();                     // (a) the previous tile's readers are done; q2 / m_s are written
         for (int i = tid; i < TILE * (kKD / 2); i += 256) {
             const int r = i / (kKD / 2), w = i - r * (kKD / 2);
             float2 f = make_float2(0.f, 0.f);
             if (r < nk) {
-                const size_t key = (size_t) (kt + r);
+                const size_t key = base + (size_t) r;
                 if (kv_mode == KV_F16) {
                     const __half* row = static_cast<const __half*>(cache) + key * kKD;
                     f = make_float2(__half2float(row[2 * w]), __half2float(row[2 * w + 1]));
@@ -270,7 +272,7 @@ constexpr size_t kSmem = (size_t) kMaxHeads * QLD * 2 + (size_t) WT * QLD * 2 + 
 
 __global__ void __launch_bounds__(256) mla_decode_tc_kernel(const float* Qf, const void* cache, const float* scales,
                                                             int kv_mode, const int32_t* pos, int n_head, float kq_scale,
-                                                            float* part) {
+                                                            float* part, KvMap map) {
     using namespace nvcuda;
     using namespace tc;
     extern __shared__ __align__(128) unsigned char smem[];
@@ -307,13 +309,14 @@ __global__ void __launch_bounds__(256) mla_decode_tc_kernel(const float* Qf, con
     }
     for (int kt = k0; kt < k1; kt += WT) {
         const int nk = min(WT, k1 - kt);
+        const size_t base = kv_row(map, t, kt);   // a tile stays within one page
         __syncthreads();   // (a) the previous tile's readers are done
         // 1. the key rows as f16 (4 values per item; rows beyond the range are zero)
         for (int i = tid; i < WT * (kKD / 4); i += 256) {
             const int r = i / (kKD / 4), w = (i - r * (kKD / 4)) * 4;
             __half2 lo = __floats2half2_rn(0.f, 0.f), hi = lo;
             if (r < nk) {
-                const size_t key = (size_t) (kt + r);
+                const size_t key = base + (size_t) r;
                 if (kv_mode == KV_F16) {
                     const __half2* row = reinterpret_cast<const __half2*>(static_cast<const __half*>(cache) + key * kKD + w);
                     lo = row[0];
@@ -417,15 +420,18 @@ __global__ void mla_merge_kernel(const float* part, float* O, int n_head) {
     O[((size_t) t * n_head + h) * kLat + d] = L > 0.f ? acc / L : 0.f;
 }
 
-__global__ void cache_to_f16_kernel(const void* cache, const float* scales, int kv_mode, int n, __half* K16) {
+__global__ void cache_to_f16_kernel(const void* cache, const float* scales, int kv_mode, int n, __half* K16,
+                                    KvMap map) {
     const size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= (size_t) n * kKD) return;
+    const size_t k = i / kKD, d = i % kKD;
+    const size_t r = kv_row(map, 0, (int) k);   // key k's cache row
+    const size_t src = r * kKD + d;
     if (kv_mode == KV_F16) {
-        K16[i] = static_cast<const __half*>(cache)[i];
+        K16[i] = static_cast<const __half*>(cache)[src];
         return;
     }
-    const size_t r = i / kKD, d = i % kKD;
-    K16[i] = __float2half((float) static_cast<const int8_t*>(cache)[i] * scales[r * 2 + (d >= (size_t) kLat ? 1 : 0)]);
+    K16[i] = __float2half((float) static_cast<const int8_t*>(cache)[src] * scales[r * 2 + (d >= (size_t) kLat ? 1 : 0)]);
 }
 
 __global__ void f32_to_f16_kernel(const float* x, __half* y, size_t n, float scale) {
@@ -795,10 +801,10 @@ void rope_table_host(float* out, int n_pos, int n_rot, float freq_base, float fr
 }
 
 void mla_kv_write(const float* kvp, const float* kv_norm, const float* rope_tab, const int32_t* pos, int T, int kv_mode,
-                  void* cache, float* scales, float eps, cudaStream_t s) {
+                  void* cache, float* scales, float eps, cudaStream_t s, KvMap map) {
     if (T <= 0) return;
     mla_kv_write_kernel<<<T, kLat, 0, s>>>(kvp, kv_norm, reinterpret_cast<const float2*>(rope_tab), pos, kv_mode, cache,
-                                            scales, eps);
+                                            scales, eps, map);
     check("mla_kv_write");
 }
 
@@ -813,7 +819,7 @@ void mla_q_rope(const float* q, float* Qf, const float* rope_tab, const int32_t*
 size_t mla_decode_part_floats(int T, int n_head) { return (size_t) T * kAttnChunks * n_head * (kLat + 2); }
 
 void mla_attn_decode(const float* Qf, const void* cache, const float* scales, int kv_mode, const int32_t* pos, int T,
-                     int n_head, float kq_scale, float* part, float* O, cudaStream_t s, int impl) {
+                     int n_head, float kq_scale, float* part, float* O, cudaStream_t s, int impl, KvMap map) {
     if (n_head > kMaxHeads) {
         std::fprintf(stderr, "strata-m4: %d heads, the decode attention takes %d\n", n_head, kMaxHeads);
         std::exit(1);
@@ -831,20 +837,22 @@ void mla_attn_decode(const float* Qf, const void* cache, const float* scales, in
             attr = true;
         }
         mla_decode_tc_kernel<<<dim3(kAttnChunks, T), 256, tc::kSmem, s>>>(Qf, cache, scales, kv_mode, pos, n_head,
-                                                                          kq_scale, part);
+                                                                          kq_scale, part, map);
         check("mla_decode_tc");
     } else {
-        mla_decode_kernel<<<dim3(kAttnChunks, T), 256, 0, s>>>(Qf, cache, scales, kv_mode, pos, n_head, kq_scale, part);
+        mla_decode_kernel<<<dim3(kAttnChunks, T), 256, 0, s>>>(Qf, cache, scales, kv_mode, pos, n_head, kq_scale, part,
+                                                                map);
         check("mla_decode");
     }
     mla_merge_kernel<<<dim3(T, n_head), kLat, 0, s>>>(part, O, n_head);
     check("mla_merge");
 }
 
-void mla_cache_to_f16(const void* cache, const float* scales, int kv_mode, int n, __half* K16, cudaStream_t s) {
+void mla_cache_to_f16(const void* cache, const float* scales, int kv_mode, int n, __half* K16, cudaStream_t s,
+                      KvMap map) {
     const size_t tot = (size_t) n * kKD;
     if (tot == 0) return;
-    cache_to_f16_kernel<<<(unsigned) ((tot + 255) / 256), 256, 0, s>>>(cache, scales, kv_mode, n, K16);
+    cache_to_f16_kernel<<<(unsigned) ((tot + 255) / 256), 256, 0, s>>>(cache, scales, kv_mode, n, K16, map);
     check("cache_to_f16");
 }
 

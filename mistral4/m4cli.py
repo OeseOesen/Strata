@@ -2,6 +2,7 @@
 """strata-m4 - the command for the Mistral Small 4 engine, in the manner of Strata's own `strata` command.
 
     strata-m4 launch            start the server in the background (if it is not running) and open the monitor
+                                (--parallel N: N conversations at once for this start; for good: config set M4_PARALLEL N)
     strata-m4 serve             run the server in the foreground (Ctrl+C stops it)
     strata-m4 stop              stop the server (graceful, then forced after --grace seconds)
     strata-m4 restart           stop, then launch without the monitor
@@ -12,7 +13,8 @@
     strata-m4 doctor            read-only checks: GPU, files, venv, monitor, port
     strata-m4 bench | speed | sanity | parity | longctx [options]   the measuring scripts (server stopped first)
 
-Settings live in ~/strata-m4/m4.env (M4_MODEL, M4_TOKENIZER, M4_ENGINE_ARGS, M4_PORT, M4_HOST, M4_API_KEY, ...).
+Settings live in ~/strata-m4/m4.env (M4_MODEL, M4_TOKENIZER, M4_ENGINE_ARGS, M4_PORT, M4_HOST, M4_API_KEY,
+M4_PARALLEL, ...).
 """
 from __future__ import annotations
 
@@ -125,7 +127,7 @@ def alive(pid: int) -> bool:
         return True
 
 
-def start_background(env) -> int:
+def start_background(env, extra: list[str] | None = None) -> int:
     LOGS.mkdir(parents=True, exist_ok=True)
     RUN.mkdir(parents=True, exist_ok=True)
     log = LOGS / time.strftime("server-%Y%m%d-%H%M%S.log")
@@ -137,7 +139,7 @@ def start_background(env) -> int:
     except OSError:
         pass
     f = open(log, "ab", buffering=0)
-    p = subprocess.Popen([str(HOME / "start-m4.sh")], stdin=subprocess.DEVNULL, stdout=f, stderr=subprocess.STDOUT,
+    p = subprocess.Popen([str(HOME / "start-m4.sh"), *(extra or [])], stdin=subprocess.DEVNULL, stdout=f, stderr=subprocess.STDOUT,
                          start_new_session=True, close_fds=True)
     PIDFILE.write_text(str(p.pid))
     return p.pid
@@ -148,8 +150,8 @@ def wait_ready(env, pid: int, limit: float = 600.0) -> bool:
     log = LOGS / "server.log"
     seen = 0
     t0 = time.time()
-    keys = ("experts:", "EAGLE head", "pinned", "latent KV", "default system prompt", "listening", "error", "Traceback",
-            "failed", "fail:")
+    keys = ("experts:", "EAGLE head", "pinned", "latent KV", "parallel:", "default system prompt", "listening", "error",
+            "Traceback", "failed", "fail:")
     while time.time() - t0 < limit:
         try:
             lines = log.read_text(errors="replace").splitlines()
@@ -206,15 +208,26 @@ def stop(grace: float = 30.0) -> bool:
 
 
 # ---------------------------------------------------------------------------------------------- commands
+def parallel_args(a) -> list[str]:
+    n = getattr(a, "parallel", None)
+    if n is None:
+        return []
+    if not 1 <= n <= 8:
+        sys.exit("strata-m4: --parallel takes 1 to 8")
+    return ["--parallel", str(n)]
+
+
 def cmd_launch(a, env) -> int:
     if healthy(env):
         print(f"strata-m4: the server is running on port {port(env)}")
+        if getattr(a, "parallel", None) is not None:
+            print("  (--parallel applies to a new start: strata-m4 restart --parallel N)")
     else:
         if server_pids():
             print("strata-m4: a server process exists but does not answer; stopping it first")
             stop(a.grace)
         print(f"strata-m4: starting the server on port {port(env)} (log: {LOGS / 'server.log'})")
-        pid = start_background(env)
+        pid = start_background(env, parallel_args(a))
         if not wait_ready(env, pid, a.timeout):
             return 1
         print(f"strata-m4: ready - http://{env.get('M4_HOST', '127.0.0.1')}:{port(env)}/v1")
@@ -226,7 +239,7 @@ def cmd_launch(a, env) -> int:
 def cmd_serve(a, env) -> int:
     if healthy(env) or server_pids():
         sys.exit("strata-m4: a server is already running (strata-m4 stop)")
-    os.execv(str(HOME / "start-m4.sh"), [str(HOME / "start-m4.sh"), *a.rest])
+    os.execv(str(HOME / "start-m4.sh"), [str(HOME / "start-m4.sh"), *parallel_args(a), *a.rest])
     return 0
 
 
@@ -267,9 +280,11 @@ def cmd_status(a, env) -> int:
     print(f"  model      {t.get('model', {}).get('id')}  context {eng.get('ctx')}  kv {eng.get('kv')}  "
           f"eagle {'on' if eng.get('eagle') else 'off'}")
     print(f"  placement  {eng.get('placement', '--')}")
-    slot = (w.get("slots") or [{}])[0]
-    print(f"  work       {w.get('active')} running ({slot.get('state')}), {w.get('queued')} waiting "
-          f"(limit {w.get('max_queue')}), rejected {w.get('admission_rejected')}, timeouts {w.get('queue_timeouts')}")
+    slots = w.get("slots") or [{}]
+    states = ", ".join(str(x.get("state")) for x in slots)
+    print(f"  work       {w.get('active')} running of {w.get('slots_effective', 1)} slot{'s' if len(slots) > 1 else ''} "
+          f"({states}), {w.get('queued')} waiting (limit {w.get('max_queue')}), rejected {w.get('admission_rejected')}, "
+          f"timeouts {w.get('queue_timeouts')}")
     print(f"  rates      answer {r.get('answer_tok_s')} tok/s, prompt {r.get('prefill_tok_s')} tok/s, "
           f"{t.get('totals', {}).get('requests')} requests, {t.get('totals', {}).get('output_tokens')} tokens out")
     print(f"  gpu        {dev.get('name')}  {fmt_gib(dev.get('mem_used'))}/{fmt_gib(dev.get('mem_total'))} GiB  "
@@ -406,13 +421,16 @@ def main() -> int:
     p.add_argument("--no-monitor", action="store_true", help="only start the server")
     p.add_argument("--timeout", type=float, default=600.0, help="seconds to wait for the server (default 600)")
     p.add_argument("--grace", type=float, default=30.0)
+    p.add_argument("--parallel", type=int, help="conversations at once for this start (1-8; default M4_PARALLEL, else 1)")
     p = sp.add_parser("serve", help="run the server in the foreground (Ctrl+C stops it)")
+    p.add_argument("--parallel", type=int, help="conversations at once (1-8)")
     p.add_argument("rest", nargs=argparse.REMAINDER, help="extra m4serve options")
     p = sp.add_parser("stop", help="stop the server (SIGINT, then forced after --grace seconds)")
     p.add_argument("--grace", type=float, default=30.0)
     p = sp.add_parser("restart", help="stop, then start in the background")
     p.add_argument("--timeout", type=float, default=600.0)
     p.add_argument("--grace", type=float, default=30.0)
+    p.add_argument("--parallel", type=int, help="conversations at once for this start (1-8)")
     p = sp.add_parser("status", help="state, model, queue, rates, GPU")
     p.add_argument("--json", action="store_true")
     p = sp.add_parser("monitor", help="Strata's terminal monitor on this server")

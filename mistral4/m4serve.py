@@ -12,7 +12,8 @@ content, reasoning_content and tool_calls.
 Endpoints: GET /health, GET /v1/models, POST /v1/chat/completions (stream or not), POST /v1/completions,
 GET /v1/telemetry and /v1/status (Strata's read-only telemetry contract, schema 1: `strata monitor --url http://host:port`
 shows this server like a Strata server; run it on port 8095 and the monitor needs no --url).
-One request runs at a time (the engine keeps one prompt cache); others wait in line.
+One request runs at a time (the engine keeps one prompt cache); others wait in line.  With the engine option
+--parallel N, up to N requests run together (each in a slot with its own prompt cache, decoded in shared windows).
 """
 from __future__ import annotations
 
@@ -64,10 +65,43 @@ class Engine:
                 self.info = json.loads(line[6:] or "{}")
                 break
         log("engine ready:", json.dumps(self.info))
+        self.parallel = max(1, int(self.info.get("parallel") or 1))
+        if self.parallel > 1:   # tagged lines (ADMIT/PP/W/T/DONE/ERR <id> ...), routed to their request by a reader
+            self.wlock, self.plock = threading.Lock(), threading.Lock()
+            self.pending: dict[str, queue.Queue] = {}
+            self.dead = False
+            threading.Thread(target=self._reader, daemon=True).start()
 
-    def generate(self, req: dict, on_tokens, cancelled, on_progress=None, on_window=None) -> dict:
+    def _send(self, line: str):
+        with self.wlock:
+            self.p.stdin.write(line + "\n")
+            self.p.stdin.flush()
+
+    def _reader(self):
+        for line in self.p.stdout:
+            f = line.rstrip("\n").split(" ", 2)
+            if f[0] in ("ADMIT", "PP", "W", "T", "DONE", "ERR") and len(f) >= 2:
+                with self.plock:
+                    q = self.pending.get(f[1])
+                if q is not None:
+                    q.put((f[0], f[2] if len(f) > 2 else ""))
+                    continue
+            if f[0] == "ERR":
+                log("engine:", line.strip())
+        with self.plock:
+            self.dead = True
+            for q in self.pending.values():
+                q.put(None)
+
+    def generate(self, req: dict, on_tokens, cancelled, on_progress=None, on_window=None, on_admit=None,
+                 admit_timeout: float | None = None) -> dict:
         """Runs one GEN; on_tokens(list[int]) per accepted window; on_progress(read, total, reused) per prompt chunk,
-        on_window(rows, taken) per decode window; returns the DONE stats."""
+        on_window(rows, taken) per decode window; on_admit(slot, reused) when it gets a slot (--parallel); returns
+        the DONE stats.  --parallel: a request without a slot after admit_timeout s is withdrawn (QueueTimeout)."""
+        if self.parallel > 1:
+            return self._generate_tagged(req, on_tokens, cancelled, on_progress, on_window, on_admit, admit_timeout)
+        if on_admit:
+            on_admit(0, None)
         self.p.stdin.write("GEN " + json.dumps(req) + "\n")
         self.p.stdin.flush()
         stopped = False
@@ -96,6 +130,64 @@ class Engine:
                 return json.loads(line[5:] or "{}")
             elif line.startswith("ERR"):
                 raise RuntimeError(line[4:].strip())
+
+    def _generate_tagged(self, req, on_tokens, cancelled, on_progress, on_window, on_admit, admit_timeout):
+        rid = uuid.uuid4().hex[:12]
+        q: queue.Queue = queue.Queue()
+        with self.plock:
+            if self.dead:
+                raise RuntimeError("strata-m4 exited")
+            self.pending[rid] = q
+        try:
+            self._send("GEN " + json.dumps({**req, "id": rid}))
+            t0 = time.time()
+            admitted = stopped = timed_out = False
+            while True:
+                try:
+                    item = q.get(timeout=0.25)
+                except queue.Empty:
+                    item = ()
+                if item is None:
+                    raise RuntimeError("strata-m4 exited")
+                if not stopped:
+                    late = not admitted and admit_timeout is not None and time.time() - t0 > admit_timeout
+                    if late or cancelled():
+                        timed_out = late
+                        self._send("STOP " + rid)
+                        stopped = True
+                if not item:
+                    continue
+                tag, rest = item
+                if tag == "T":
+                    if not stopped:
+                        on_tokens([int(x) for x in rest.split()])
+                elif tag in ("PP", "W", "ADMIT"):
+                    try:
+                        f = [int(x) for x in rest.split()]
+                    except ValueError:
+                        continue
+                    if tag == "ADMIT" and len(f) == 2:
+                        admitted = True
+                        if on_admit:
+                            on_admit(f[0], f[1])
+                    elif tag == "PP" and on_progress and len(f) == 3:
+                        on_progress(*f)
+                    elif tag == "W" and on_window and len(f) == 2:
+                        on_window(*f)
+                elif tag == "DONE":
+                    st = json.loads(rest or "{}")
+                    if timed_out and not admitted:
+                        raise QueueTimeout()
+                    return st
+                elif tag == "ERR":
+                    raise RuntimeError(rest.strip())
+        finally:
+            with self.plock:
+                self.pending.pop(rid, None)
+
+
+class QueueTimeout(Exception):
+    """--parallel: the request found no free slot within --queue-timeout s."""
 
 
 # ---------------------------------------------------------------------------------------------- images
@@ -399,7 +491,7 @@ class Chat:
 # ---------------------------------------------------------------------------------------------- telemetry
 class Telemetry:
     """What `strata monitor` reads (GET /v1/telemetry, schema 1; see terminal/strata_cli/client.py sanitize_telemetry):
-    the one slot, the queue, request transitions, rates, the GPU (nvidia-smi) and the host's RAM.  Memory in bytes."""
+    the slots (one, or the engine's --parallel N), the queue, request transitions, rates, the GPU (nvidia-smi) and the host's RAM.  Memory in bytes."""
 
     GPU_FIELDS = ("index", "name", "memory.used", "memory.total", "utilization.gpu", "temperature.gpu", "power.draw",
                   "power.limit", "pcie.link.gen.current", "pcie.link.gen.max", "pcie.link.width.current",
@@ -414,7 +506,8 @@ class Telemetry:
         self.seq = 0
         self.events = collections.deque(maxlen=64)
         self.queue: dict[str, dict] = {}          # waiting requests, in order
-        self.cur: dict | None = None              # the request on the engine
+        self.active: dict[str, dict] = {}         # the requests on the engine (each in a slot)
+        self.slots_n = 1
         self.recent = collections.deque(maxlen=50)
         self.totals = {"since": self.boot, "requests": 0, "prompt_tokens": 0, "output_tokens": 0}
         self.max_queue, self.queue_timeout = 16, 900.0
@@ -438,11 +531,12 @@ class Telemetry:
             self._event(rid, "queued")
         return rid
 
-    def admitted(self, rid: str):
+    def admitted(self, rid: str, slot: int = 0):
         with self.lock:
             row = self.queue.pop(rid, None) or {"id": rid, "queued_at": time.time(), "prompt_tokens": None}
             now = time.time()
-            self.cur = {**row, "state": "reading", "admitted_at": now, "generated": 0, "first_at": None}
+            self.active[rid] = {**row, "state": "reading", "admitted_at": now, "generated": 0, "first_at": None,
+                                "slot": slot}
             self._event(rid, "admitted")
             self._event(rid, "reading")
 
@@ -454,11 +548,16 @@ class Telemetry:
         with self.lock:
             return len(self.queue)
 
-    def progress(self, read: int, total: int, reused: int):
+    def inflight(self) -> int:
         with self.lock:
-            if self.cur is not None:
-                self.cur["prompt_tokens"] = total + reused + 1   # + the last prompt token (read by the first window)
-                self.cur["prompt_read"] = reused + read
+            return len(self.queue) + len(self.active)
+
+    def progress(self, rid: str, read: int, total: int, reused: int):
+        with self.lock:
+            c = self.active.get(rid)
+            if c is not None:
+                c["prompt_tokens"] = total + reused + 1   # + the last prompt token (read by the first window)
+                c["prompt_read"] = reused + read
 
     def window(self, rows: int, taken: int):
         with self.lock:
@@ -475,9 +574,9 @@ class Telemetry:
                 "batch_sample_span_s": round(max(1e-3, w[-1][0] - w[0][0]), 3),
                 "batch_sample_age_s": round(max(0.0, now - w[-1][0]), 3)}
 
-    def tokens(self, n: int):
+    def tokens(self, rid: str, n: int):
         with self.lock:
-            c = self.cur
+            c = self.active.get(rid)
             if c is None:
                 return
             if c["first_at"] is None:
@@ -489,7 +588,7 @@ class Telemetry:
     def finished(self, rid: str, st: dict | None, outcome: str):
         with self.lock:
             self.queue.pop(rid, None)
-            c = self.cur if self.cur and self.cur["id"] == rid else None
+            c = self.active.pop(rid, None)
             now = time.time()
             st = st or {}
             event = {"stop": "finished", "length": "finished", "cancel": "cancelled", "disconnect": "disconnected",
@@ -514,7 +613,6 @@ class Telemetry:
                 read = n_prompt - int(st.get("n_reused", 0))
                 if pms > 0 and read > 16:
                     self.last_prefill = read / (pms / 1000.0)
-                self.cur = None
 
     # -- hardware
     def _sample_gpus(self):
@@ -555,43 +653,45 @@ class Telemetry:
     def snapshot(self) -> dict:
         now = time.time()
         with self.lock:
-            c = dict(self.cur) if self.cur else None
+            act = [dict(c) for c in self.active.values()]
             queue = [dict(r) for r in self.queue.values()]
-            if c:
-                live_rate = (c["generated"] / (now - c["first_at"])) if c["first_at"] and now > c["first_at"] and c["generated"] > 1 else None
-                slot = {"slot": 0, "group": 0, "replica": None, "request_id": c["id"], "state": c["state"],
-                        "held_tokens": None, "prompt_tokens": c.get("prompt_tokens"),
-                        "prompt_read": c.get("prompt_tokens") if c["first_at"] else c.get("prompt_read"),
-                        "generated": c["generated"],
-                        "elapsed_s": round(now - c["admitted_at"], 2), "tok_s": round(live_rate, 1) if live_rate else None}
-            else:
-                live_rate = None
-                slot = {"slot": 0, "group": 0, "state": "idle", "held_tokens": None}
-            requests = [{"id": r["id"], "state": "queued", "queued_at": r["queued_at"], "admitted_at": None, "slot": None,
-                         "group": None, "replica": None, "prompt_tokens": r.get("prompt_tokens"), "prompt_read": None,
-                         "generated": None, "first_engine_token_s": None} for r in queue]
-            if c:
-                requests.insert(0, {"id": c["id"], "state": c["state"], "queued_at": c["queued_at"], "admitted_at": c["admitted_at"],
-                                    "slot": 0, "group": 0, "replica": None, "prompt_tokens": c.get("prompt_tokens"),
-                                    "prompt_read": slot["prompt_read"], "generated": c["generated"],
-                                    "first_engine_token_s": round(c["first_at"] - c["admitted_at"], 3) if c["first_at"] else None})
+            S = max(self.slots_n, 1 + max((c["slot"] for c in act), default=0))
+            slots = [{"slot": i, "group": 0, "state": "idle", "held_tokens": None} for i in range(S)]
+            requests, rates = [], []
+            for c in act:
+                live = (c["generated"] / (now - c["first_at"])) if c["first_at"] and now > c["first_at"] and c["generated"] > 1 else None
+                if live:
+                    rates.append(live)
+                read = c.get("prompt_tokens") if c["first_at"] else c.get("prompt_read")
+                slots[c["slot"]] = {"slot": c["slot"], "group": 0, "replica": None, "request_id": c["id"], "state": c["state"],
+                                    "held_tokens": None, "prompt_tokens": c.get("prompt_tokens"), "prompt_read": read,
+                                    "generated": c["generated"], "elapsed_s": round(now - c["admitted_at"], 2),
+                                    "tok_s": round(live, 1) if live else None}
+                requests.append({"id": c["id"], "state": c["state"], "queued_at": c["queued_at"], "admitted_at": c["admitted_at"],
+                                 "slot": c["slot"], "group": 0, "replica": None, "prompt_tokens": c.get("prompt_tokens"),
+                                 "prompt_read": read, "generated": c["generated"],
+                                 "first_engine_token_s": round(c["first_at"] - c["admitted_at"], 3) if c["first_at"] else None})
+            requests += [{"id": r["id"], "state": "queued", "queued_at": r["queued_at"], "admitted_at": None, "slot": None,
+                          "group": None, "replica": None, "prompt_tokens": r.get("prompt_tokens"), "prompt_read": None,
+                          "generated": None, "first_engine_token_s": None} for r in queue]
+            live_rate = sum(rates) if rates else None   # all conversations together
             answer = (live_rate, None) if live_rate else (self.last_answer or (None, None))
             return {
                 "schema_version": 1, "source": "m4serve", "sampled_at": now,
                 "instance": {"id": self.instance, "boot_time": self.boot, "server": "m4serve (strata-m4)", "state": "ready"},
                 "model": {"id": self.model_id, "loaded": True, "context": self.context},
-                "work": {"slots_requested": 1, "slots_effective": 1, "active": 1 if c else 0, "queued": len(queue),
-                         "waiting": len(queue), "outside_slots": 0, "groups": 1, "requests_omitted": 0,
-                         "max_queue": self.max_queue, "admission_limit": 1 + self.max_queue,
-                         "admission_reserved": (1 if c else 0) + len(queue), "admission_rejected": self.rejected,
+                "work": {"slots_requested": S, "slots_effective": S, "active": len(act), "queued": len(queue),
+                         "waiting": len(queue), "outside_slots": 0, "groups": 1, "requests_omitted": max(0, len(requests) - 50),
+                         "max_queue": self.max_queue, "admission_limit": S + self.max_queue,
+                         "admission_reserved": len(act) + len(queue), "admission_rejected": self.rejected,
                          "queue_timeout_s": self.queue_timeout, "queue_timeouts": self.timeouts,
                          "client_disconnect_cancels": self.disconnects,
                          "oldest_queue_s": round(max((now - r["queued_at"] for r in queue), default=0), 2),
-                         "slots": [slot], "requests": requests[:50], **self._batch(now)},
+                         "slots": slots, "requests": requests[:50], **self._batch(now)},
                 "rates": {"answer_tok_s": round(answer[0], 1) if answer[0] else None,
                           "answer_window_s": round(answer[1], 2) if answer[1] else None,
                           "prefill_tok_s": round(self.last_prefill, 1) if self.last_prefill else None,
-                          "output_tokens_server_counter": self.totals["output_tokens"] + (c["generated"] if c else 0)},
+                          "output_tokens_server_counter": self.totals["output_tokens"] + sum(c["generated"] for c in act)},
                 "topology": {"mode": "single", "selected_devices": [d["index"] for d in self.devices if d.get("index") is not None][:1],
                              "stages": [], "source": "m4serve"},
                 "devices": list(self.devices),
@@ -604,9 +704,9 @@ class Telemetry:
 
     def status(self) -> dict:
         with self.lock:
-            busy = self.cur is not None
+            busy = bool(self.active)
         return {"service": "m4serve (strata-m4)", "model": self.model_id, "loaded": True, "started": self.boot,
-                "cache_max_tokens": self.context, "busy": busy, "concurrency": {"serving": 1}}
+                "cache_max_tokens": self.context, "busy": busy, "concurrency": {"serving": self.slots_n}}
 
 
 # ---------------------------------------------------------------------------------------------- HTTP
@@ -632,19 +732,31 @@ def make_handler(S: State):
         """One engine request behind the line (--queue-timeout s at most), with its telemetry transitions."""
         rid = S.tele.queued(len(req.get("ids") or []))
         st, outcome = None, "error"
-        try:
-            if not gate.acquire(timeout=S.tele.queue_timeout):
-                outcome = "timeout"
-                raise Busy(503, f"waited {S.tele.queue_timeout:.0f} s in the queue; the server is busy")
-            try:
-                S.tele.admitted(rid)
 
-                def tok(ids_):
-                    S.tele.tokens(len(ids_))
-                    on_tokens(ids_)
-                st = S.engine.generate(req, tok, cancelled, S.tele.progress, S.tele.window)
-            finally:
-                gate.release()
+        def tok(ids_):
+            S.tele.tokens(rid, len(ids_))
+            on_tokens(ids_)
+
+        def prog(read, total, reused):
+            S.tele.progress(rid, read, total, reused)
+        try:
+            if S.engine.parallel > 1:   # the engine keeps the line: a request waits there for a slot
+                try:
+                    st = S.engine.generate(req, tok, cancelled, prog, S.tele.window,
+                                           on_admit=lambda slot, reused: S.tele.admitted(rid, slot),
+                                           admit_timeout=S.tele.queue_timeout)
+                except QueueTimeout:
+                    outcome = "timeout"
+                    raise Busy(503, f"waited {S.tele.queue_timeout:.0f} s in the queue; the server is busy")
+            else:
+                if not gate.acquire(timeout=S.tele.queue_timeout):
+                    outcome = "timeout"
+                    raise Busy(503, f"waited {S.tele.queue_timeout:.0f} s in the queue; the server is busy")
+                try:
+                    S.tele.admitted(rid)
+                    st = S.engine.generate(req, tok, cancelled, prog, S.tele.window)
+                finally:
+                    gate.release()
             fin = st.get("finish")
             outcome = "stop" if fin == "stop" else "length" if fin in ("length", "context") else \
                 "disconnect" if cancelled() else "cancel" if fin == "abort" else "error"
@@ -707,7 +819,11 @@ def make_handler(S: State):
 
         def _full(self) -> bool:
             """--max-queue requests waiting already: refused at once (503), as Strata's admission does."""
-            if gate.locked() and S.tele.waiting() >= S.tele.max_queue:
+            if S.engine.parallel > 1:
+                full = S.tele.inflight() >= S.engine.parallel + S.tele.max_queue
+            else:
+                full = gate.locked() and S.tele.waiting() >= S.tele.max_queue
+            if full:
                 S.tele.reject()
                 self._json(503, {"error": {"message": f"server busy: {S.tele.max_queue} requests are waiting",
                                            "type": "server_error", "code": "queue_full"}})
@@ -875,6 +991,8 @@ def main():
     ap.add_argument("--system-prompt", default="auto",
                     help="for requests without a system message: auto (Mistral's SYSTEM_PROMPT.txt from the --tokenizer "
                          "repo), none, or a file")
+    ap.add_argument("--parallel", type=int, default=None,
+                    help="conversations at once (the engine's --parallel; 1-8; overrides one in --engine-args)")
     ap.add_argument("--max-queue", type=int, default=16, help="requests that may wait for the engine (more: 503 at once)")
     ap.add_argument("--queue-timeout", type=float, default=900.0, help="seconds a request may wait for the engine (then 503)")
     ap.add_argument("--max-tokens", type=int, default=4096)
@@ -887,11 +1005,15 @@ def main():
     S.chat.default_system = load_default_system_prompt(
         a.system_prompt, a.tokenizer if not os.path.exists(a.tokenizer) else "mistralai/Mistral-Small-4-119B-2603")
     S.vision = Vision(a.vision, a.mmproj, a.model, a.vision_cpu) if a.mmproj else None
-    S.engine = Engine(a.engine, a.model, shlex.split(a.engine_args))
+    eargs = shlex.split(a.engine_args)
+    if a.parallel is not None:
+        eargs += ["--parallel", str(max(1, min(8, a.parallel)))]
+    S.engine = Engine(a.engine, a.model, eargs)
     S.model_name, S.api_key = a.model_name, (None if (a.api_key or "").strip().lower() in ("", "none") else a.api_key.strip())
     log("API key:", "required" if S.api_key else "none (every client on the network may use this server)")
     S.tele = Telemetry(a.model_name + " (" + os.path.basename(a.model) + ")")
     S.tele.context = S.engine.info.get("ctx")
+    S.tele.slots_n = S.engine.parallel
     S.tele.max_queue, S.tele.queue_timeout = max(0, a.max_queue), max(1.0, a.queue_timeout)
     S.defaults = {"max_tokens": a.max_tokens, "temperature": a.temperature, "top_p": a.top_p}
     srv = ThreadingHTTPServer((a.host, a.port), make_handler(S))
@@ -900,7 +1022,8 @@ def main():
         raise KeyboardInterrupt  # SIGINT unless the program sets its own handler: the "zombie" m4serve of AUFTRAG-18)
     signal.signal(signal.SIGINT, _stop)
     signal.signal(signal.SIGTERM, _stop)
-    log(f"listening on http://{a.host}:{a.port}/v1 (model name '{a.model_name}')")
+    log(f"listening on http://{a.host}:{a.port}/v1 (model name '{a.model_name}'"
+        + (f", {S.engine.parallel} requests at once)" if S.engine.parallel > 1 else ")"))
     try:
         srv.serve_forever()
     except KeyboardInterrupt:

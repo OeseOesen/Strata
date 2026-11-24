@@ -120,6 +120,9 @@ struct Options {
     // prompt path: experts not in VRAM streamed to the GPU over PCIe (pinned arenas, a ring of slots on a copy stream)
     // and every product of a chunk on the tensor cores (weights dequantized to f16, cuBLAS) - Strata's prompt trick
     int pf_stream = 1, pf_min = 768, pf_ring = 12;
+    // parallel slots (serve mode): conversations decoded together in one window; the latent KV is a pool of pages of
+    // 256 rows that each conversation takes as it grows (--ctx is the pool, not a per-slot limit)
+    int parallel = 1, pf_interleave = 1024;
     bool pf_gemm = true, chunk_set = false;
     double vram_reserve = 1.5, vram_experts = -1, ram_gpu_node = -1, ram_other_node = -1;
     std::string eagle;            // EAGLE draft head: Mistral's consolidated.safetensors (or its folder)
@@ -148,6 +151,10 @@ void usage() {
                  "                           the tensor cores; 0 = the CPU pool computes them (default 1)\n"
                  "  --pf-min N               smallest chunk that streams (default 768; below it the CPU pool is faster)\n"
                  "  --pf-ring N              expert slots of the stream ring in VRAM (default 12)\n"
+                 "  --parallel N             serve mode: N conversations at once (decoded together; the KV cache of --ctx\n"
+                 "                           tokens is shared in pages of 256 and grows with each conversation; default 1)\n"
+                 "  --pf-interleave N        parallel: a prompt is read in chunks of at most N tokens while others decode\n"
+                 "                           (default 1024)\n"
                  "  --pf-gemm 0|1            prompt chunks of 64+ tokens: dense products as f16 tensor-core GEMMs (default 1)\n"
                  "  --spec N                 n-gram draft tokens per window, 0 = off (default 6, max 15)\n"
                  "  --vram-reserve GiB       VRAM left free (default 1.5)\n"
@@ -200,6 +207,8 @@ Options parse(int argc, char** argv) {
         else if (a == "--pf-min") o.pf_min = std::stoi(next());
         else if (a == "--pf-ring") o.pf_ring = std::stoi(next());
         else if (a == "--pf-gemm") o.pf_gemm = std::stoi(next()) != 0;
+        else if (a == "--parallel") o.parallel = std::stoi(next());
+        else if (a == "--pf-interleave") o.pf_interleave = std::stoi(next());
         else if (a == "--spec") o.spec = std::stoi(next());
         else if (a == "--vram-reserve") o.vram_reserve = std::stod(next());
         else if (a == "--vram-experts") o.vram_experts = std::stod(next());
@@ -234,6 +243,11 @@ Options parse(int argc, char** argv) {
     if (!o.chunk_set && o.pf_stream) o.chunk = 2048;
     o.chunk = std::max(kMaxWin + 1, o.chunk);
     o.pf_ring = std::max(2, std::min(o.pf_ring, 64));
+    o.parallel = std::max(1, std::min(o.parallel, 8));
+    o.pf_interleave = std::max(kMaxWin + 1, o.pf_interleave);
+    if (o.parallel > 1) o.ctx = (o.ctx + m4k::kPage - 1) / m4k::kPage * m4k::kPage;   // whole pages
+    if (o.parallel > 1 && o.mode != "serve") fail("--parallel is for --serve");
+    if (o.parallel > 1 && o.attn_gemm) fail("--parallel needs the decode attention kernels (not --attn gemm)");
     if (o.heat.empty()) o.heat = o.model + ".m4heat";
     return o;
 }
@@ -501,6 +515,16 @@ private:
     void ensure_w16(size_t elems);
     void ensure_x16(size_t elems);
     void register_arenas();
+public:
+    int serve_parallel();
+private:
+    void run_window_rows(const int32_t* toks, const int32_t* pos, const int32_t* slots, int T);
+    void launch_window(int T);
+    bool ensure_pages(int slot, int last_pos);
+    void trim_pages(int slot, int keep_pos);
+    void sync_ptab(int slot, int from_page);
+    void eagle_pick_rows(const float* rows, int n, const int* dst);
+    void stash_first_draft(int slot);
     void ffn_dense(Layer& L, int T);
     void embed(const int32_t* d_tokens, int T);
     void enqueue_window(int T);
@@ -557,6 +581,26 @@ private:
     void* ngram_mem_ = nullptr;
     size_t ngram_bytes_ = 0;
     std::vector<std::pair<void*, size_t>> arenas_;
+    // parallel slots: the page pool of the latent KV (rows of every layer's cache, the EAGLE head's too)
+    m4k::KvMap kvm_{};                                 // the page map attention uses now (empty: row = position)
+    int n_pages_ = 0;
+    int32_t *d_ptab_ = nullptr, *h_ptab_ = nullptr;    // [slot][page of the conversation] -> pool page
+    int32_t *d_rslot_ = nullptr, *d_erslot_ = nullptr, *d_erpos_ = nullptr;   // per window row: its slot (main, EAGLE)
+    int32_t *d_sdraft_ = nullptr;                      // per slot: EAGLE's draft chain [slot][kMaxWin]
+    int32_t* pq_ = nullptr;                            // pinned staging of the parallel windows (see kPq*)
+    float *d_sprob_ = nullptr, *d_shid_ = nullptr;     // its probabilities; the head's last hidden row [slot][E]
+    std::vector<int> free_pages_;
+    struct Slot {
+        std::vector<int32_t> cached;                   // tokens whose KV rows are valid (the slot's prompt cache)
+        std::string embd_key;
+        int eagle_valid = 0;
+        bool eagle_ready = false;                      // d_sdraft_[slot][0] and d_shid_ hold a fresh first draft
+        std::vector<int> pages;                        // pool pages of positions [i*256, (i+1)*256)
+        uint64_t used = 0;                             // LRU tick
+        bool busy = false;
+    };
+    std::vector<Slot> slots_;
+    uint64_t tick_ = 0;
     // the streamed prompt path
     cudaStream_t cs_ = nullptr;                       // copy stream
     std::vector<cudaEvent_t> ev_copied_, ev_free_;     // per ring slot
@@ -925,7 +969,7 @@ void Engine::alloc_buffers() {
     CK(cudaHostAlloc((void**) &pids_, T * k * 4 * 2, 0));
     CK(cudaHostAlloc((void**) &pcpu_, T * k * E * 4, 0));
     CK(cudaHostAlloc((void**) &pcpu_row_, T * k * 4, 0));
-    CK(cudaHostAlloc((void**) &ptok_, T * 4 * 2, 0));
+    CK(cudaHostAlloc((void**) &ptok_, T * 4 * 3, 0));   // tokens | positions | row slots
     hlogits_.resize((size_t) kMaxWin * hp_.n_vocab);
     CB(cublasCreate(&cb_));
     CB(cublasSetStream(cb_, s_));
@@ -958,6 +1002,29 @@ void Engine::alloc_buffers() {
         CK(cudaHostAlloc((void**) &prows_, T * k * 4, 0));
         logf_("prompt streaming: chunks of %d+ tokens, ring of %d expert slots (%.2f GiB)", opt_.pf_min, opt_.pf_ring,
               (double) opt_.pf_ring * ring_stride_ / GiB);
+    }
+    if (opt_.parallel > 1) {
+        // the page pool: every layer's cache (and the EAGLE head's) keeps its ctx rows; a conversation's position p
+        // lives in row page_table[slot][p / 256] * 256 + p % 256, so a conversation takes pages as it grows
+        const int S = opt_.parallel;
+        n_pages_ = opt_.ctx / m4k::kPage;
+        const size_t nt = (size_t) S * n_pages_;
+        CK(cudaMalloc(&d_ptab_, nt * 4));
+        CK(cudaMemset(d_ptab_, 0, nt * 4));   // entries past a conversation's pages are never read
+        CK(cudaHostAlloc((void**) &h_ptab_, nt * 4, 0));
+        std::memset(h_ptab_, 0, nt * 4);
+        CK(cudaMalloc(&d_rslot_, kMaxWin * 4));
+        CK(cudaMalloc(&d_erslot_, kMaxWin * 4));
+        CK(cudaMalloc(&d_erpos_, kMaxWin * 4));
+        CK(cudaMalloc(&d_sdraft_, (size_t) S * kMaxWin * 4));
+        CK(cudaMalloc(&d_sprob_, (size_t) S * kMaxWin * 4));
+        CK(cudaMalloc(&d_shid_, (size_t) S * E * 4));
+        CK(cudaHostAlloc((void**) &pq_, (size_t) (3 * kMaxWin + 2 * S * kMaxWin + 64) * 4, 0));
+        free_pages_.clear();
+        for (int pg = n_pages_ - 1; pg >= 0; --pg) free_pages_.push_back(pg);
+        slots_.assign((size_t) S, Slot{});
+        logf_("parallel: %d conversations share the KV cache of %d tokens (%d pages of %d tokens; each takes pages as "
+              "it grows, idle prompt caches give theirs back from the end)", S, opt_.ctx, n_pages_, m4k::kPage);
     }
     if (opt_.pf_stream || opt_.pf_gemm) {
         CK(cudaMalloc(&d_xinv_, T * 4));
@@ -1285,7 +1352,8 @@ json Engine::info() const {
     return json{{"model", opt_.model},       {"ctx", opt_.ctx},          {"vocab", hp_.n_vocab},
                 {"kv", opt_.kv == m4k::KV_I8 ? "int8" : "f16"},   {"spec", opt_.spec},
                 {"placement", placement_},    {"numa", opt_.numa},       {"workers", pool_ ? pool_->workers() : 0},
-                {"eagle", eagle_on_},         {"eagle_k", opt_.eagle_k}, {"eagle_p", opt_.eagle_p}};
+                {"eagle", eagle_on_},         {"eagle_k", opt_.eagle_k}, {"eagle_p", opt_.eagle_p},
+                {"parallel", opt_.parallel},  {"pf_interleave", opt_.pf_interleave}};
 }
 
 void Engine::save_heat() const {
@@ -1404,7 +1472,7 @@ void Engine::attention(Layer& L, int T, bool window, int pos0, const int32_t* po
     }
     mm(L.wkv_a, xn_, xq_, kvp_, T, s_);
     dbg("kv_cmpr_pe", li, kvp_, T, m4k::kKD);
-    m4k::mla_kv_write(kvp_, L.kv_a_norm, rope_, P, T, opt_.kv, L.kv, L.kv_s, hp_.eps, s_);
+    m4k::mla_kv_write(kvp_, L.kv_a_norm, rope_, P, T, opt_.kv, L.kv, L.kv_s, hp_.eps, s_, kvm_);
     if (dbg_on_ && opt_.kv == m4k::KV_F16) {   // the cache rows this chunk wrote, as f32: [kv_cmpr (normed) | k_pe (roped)]
         m4k::mla_cache_to_f16(L.kv, L.kv_s, opt_.kv, pos0 + T, K16_, s_);
         std::vector<__half> hh((size_t) T * m4k::kKD);
@@ -1425,11 +1493,11 @@ void Engine::attention(Layer& L, int T, bool window, int pos0, const int32_t* po
     m4k::mla_q_rope(q_, Qf_, rope_, P, T, H, ts, tf, s_);
     dbg("Qcur[absorbed|q_pe]", li, Qf_, T * H, m4k::kKD);
     if (window && !opt_.attn_gemm) {
-        m4k::mla_attn_decode(Qf_, L.kv, L.kv_s, opt_.kv, P, T, H, hp_.kq_scale, part_, Olat_, s_, opt_.attn_impl);
+        m4k::mla_attn_decode(Qf_, L.kv, L.kv_s, opt_.kv, P, T, H, hp_.kq_scale, part_, Olat_, s_, opt_.attn_impl, kvm_);
     } else {
         // prompt chunk at positions pos0 .. pos0+T-1: K rows 0 .. pos0+T-1 as f16, S = K^T Q, causal softmax, O = V P
         const int n_kv = pos0 + T;
-        m4k::mla_cache_to_f16(L.kv, L.kv_s, opt_.kv, n_kv, K16_, s_);
+        m4k::mla_cache_to_f16(L.kv, L.kv_s, opt_.kv, n_kv, K16_, s_, kvm_);   // kvm_: one conversation (no rslot)
         m4k::f32_to_f16_scaled(Qf_, Q16_, (size_t) T * H * m4k::kKD, hp_.kq_scale, s_);
         const int per = std::max(1, (int) std::min<size_t>((size_t) T, S_floats_ / ((size_t) n_kv * H)));
         for (int a = 0; a < T; a += per) {
@@ -1928,6 +1996,24 @@ void Engine::eagle_pick(const float* row, int slot) {
     m4k::argmax_prob(elogits_, hp_.n_vocab, d_edraft_ + slot, d_eprob_ + slot, s_);
 }
 
+/// Parallel slots: the model's head on n EAGLE rows (contiguous): greedy token and probability of row i into
+/// d_sdraft_[dst[i]], d_sprob_[dst[i]] (dst = slot * kMaxWin + chain step).  One pass over the head's weights.
+void Engine::eagle_pick_rows(const float* rows, int n, const int* dst) {
+    q8(rows, xq_, hp_.n_embd, n, s_);
+    mm(head_, rows, xq_, logits_, n, s_);
+    for (int i = 0; i < n; ++i)
+        m4k::argmax_prob(logits_ + (size_t) i * hp_.n_vocab, hp_.n_vocab, d_sdraft_ + dst[i], d_sprob_ + dst[i], s_);
+}
+
+/// Parallel slots: eagle_follow just ran over the slot's prompt; its first draft and hidden row become the slot's.
+void Engine::stash_first_draft(int slot) {
+    const int E = hp_.n_embd;
+    CK(cudaMemcpyAsync(d_sdraft_ + (size_t) slot * kMaxWin, d_edraft_, 4, cudaMemcpyDeviceToDevice, s_));
+    CK(cudaMemcpyAsync(d_sprob_ + (size_t) slot * kMaxWin, d_eprob_, 4, cudaMemcpyDeviceToDevice, s_));
+    CK(cudaMemcpyAsync(d_shid_ + (size_t) slot * E, e_last_, (size_t) E * 4, cudaMemcpyDeviceToDevice, s_));
+    eagle_ready_ = false;
+}
+
 /// After the model ran T rows at positions pos0.. (rows_normed: a window, its head left the normed rows in xn_;
 /// otherwise a prompt chunk with the residual stream in x_): the EAGLE rows for the same positions, with next[i] the
 /// token at pos0+i+1.  Leaves the first draft (the token after next[T-1]) in d_edraft_[0].
@@ -2099,6 +2185,27 @@ void Engine::run_window(const std::vector<int32_t>& toks, int pos0, bool all_log
     }
     CK(cudaMemcpyAsync(d_tok_, ptok_, (size_t) T * 4, cudaMemcpyHostToDevice, s_));
     CK(cudaMemcpyAsync(d_pos_, ptok_ + kMaxWin, (size_t) T * 4, cudaMemcpyHostToDevice, s_));
+    kvm_ = {};
+    launch_window(T);
+}
+
+/// A window whose rows belong to several conversations: row i is token toks[i] at position pos[i] of slot slots[i]
+/// (each row attends to its own slot's pages).  Same graphs as run_window, captured with the row map.
+void Engine::run_window_rows(const int32_t* toks, const int32_t* pos, const int32_t* slots, int T) {
+    win_pos0_ = pos[0];
+    for (int i = 0; i < T; ++i) {
+        ptok_[i] = toks[i];
+        ptok_[kMaxWin + i] = pos[i];
+        ptok_[2 * kMaxWin + i] = slots[i];
+    }
+    CK(cudaMemcpyAsync(d_tok_, ptok_, (size_t) T * 4, cudaMemcpyHostToDevice, s_));
+    CK(cudaMemcpyAsync(d_pos_, ptok_ + kMaxWin, (size_t) T * 4, cudaMemcpyHostToDevice, s_));
+    CK(cudaMemcpyAsync(d_rslot_, ptok_ + 2 * kMaxWin, (size_t) T * 4, cudaMemcpyHostToDevice, s_));
+    kvm_ = m4k::KvMap{d_ptab_, n_pages_, d_rslot_};
+    launch_window(T);
+}
+
+void Engine::launch_window(int T) {
     hs_->seq = ++seq_;
     std::atomic_thread_fence(std::memory_order_seq_cst);
     // Eagerly enqueued windows (the first of each size, or --no-graph) are ~1000 launches: more than the stream's
@@ -2138,9 +2245,71 @@ void Engine::run_window(const std::vector<int32_t>& toks, int pos0, bool all_log
     }
 }
 
+// ------------------------------------------------------------------------------------------------ KV pages (parallel)
+/// The slot's table entries [from, its page count) to the GPU.  Rare (once per 256 tokens of a conversation), so the
+/// copy waits: the pinned entries may change right after.
+void Engine::sync_ptab(int slot, int from) {
+    const Slot& sl = slots_[(size_t) slot];
+    const int n = (int) sl.pages.size() - from;
+    if (n <= 0) return;
+    const size_t o = (size_t) slot * n_pages_ + (size_t) from;
+    CK(cudaMemcpyAsync(d_ptab_ + o, h_ptab_ + o, (size_t) n * 4, cudaMemcpyHostToDevice, s_));
+    CK(cudaStreamSynchronize(s_));
+}
+
+/// Pages for positions [0, last_pos] of the slot's conversation.  A page comes from the free pool or, when that is
+/// empty, from the end of the least recently used idle slot's prompt cache (its prefix - the system prompt, the
+/// older turns - stays reusable).  False: every page belongs to a running conversation.
+bool Engine::ensure_pages(int slot, int last_pos) {
+    Slot& sl = slots_[(size_t) slot];
+    const int need = last_pos / m4k::kPage + 1;
+    if (last_pos < 0) return true;
+    if (need > n_pages_) return false;
+    const int from = (int) sl.pages.size();
+    bool ok = true;
+    while ((int) sl.pages.size() < need) {
+        if (free_pages_.empty()) {
+            int v = -1;
+            for (int i = 0; i < (int) slots_.size(); ++i) {
+                const Slot& o = slots_[(size_t) i];
+                if (i == slot || o.busy || o.pages.empty()) continue;
+                if (v < 0 || o.used < slots_[(size_t) v].used) v = i;
+            }
+            if (v < 0) { ok = false; break; }
+            Slot& o = slots_[(size_t) v];
+            free_pages_.push_back(o.pages.back());
+            o.pages.pop_back();
+            const size_t keep = o.pages.size() * (size_t) m4k::kPage;
+            if (o.cached.size() > keep) o.cached.resize(keep);
+            o.eagle_valid = std::min(o.eagle_valid, (int) keep);
+            o.eagle_ready = false;
+        }
+        const int pg = free_pages_.back();
+        free_pages_.pop_back();
+        h_ptab_[(size_t) slot * n_pages_ + sl.pages.size()] = pg;
+        sl.pages.push_back(pg);
+    }
+    sync_ptab(slot, from);
+    return ok;
+}
+
+/// Keep the pages of positions [0, keep_pos); the rest go back to the pool.
+void Engine::trim_pages(int slot, int keep_pos) {
+    Slot& sl = slots_[(size_t) slot];
+    const size_t keep = (size_t) ((std::max(0, keep_pos) + m4k::kPage - 1) / m4k::kPage);
+    while (sl.pages.size() > keep) {
+        free_pages_.push_back(sl.pages.back());
+        sl.pages.pop_back();
+    }
+    const size_t rows = keep * (size_t) m4k::kPage;
+    if (sl.cached.size() > rows) sl.cached.resize(rows);
+    sl.eagle_valid = std::min(sl.eagle_valid, (int) rows);
+}
+
 // ------------------------------------------------------------------------------------------------ prompts
 void Engine::prefill(const int32_t* toks, int T, int pos0, const GenParams* gp, int prompt_off, bool all_logits) {
     (void) all_logits;
+    if (!d_ptab_) kvm_ = {};   // single conversation (parallel mode sets the slot's map before calling)
     for (int i = 0; i < T; ++i) {
         ptok_[i] = toks[i];
         ptok_[Tm_ + i] = pos0 + i;
@@ -2532,12 +2701,39 @@ struct LineReader {
         q.pop_front();
         return true;
     }
+    bool try_next(std::string& out) {   // without waiting
+        std::lock_guard<std::mutex> g(mu);
+        if (q.empty()) return false;
+        out = q.front();
+        q.pop_front();
+        return true;
+    }
 };
 
 void out_line(const std::string& s) {
     std::fwrite(s.data(), 1, s.size(), stdout);
     std::fputc('\n', stdout);
     std::fflush(stdout);
+}
+
+bool parse_gen(const json& req, Engine::GenParams& gp, std::vector<int32_t>& ids, std::string& err) {
+    try {
+        gp.max_new = req.value("max_new", 256);
+        gp.temp = req.value("temp", 0.f);
+        gp.top_p = req.value("top_p", 1.f);
+        gp.top_k = req.value("top_k", 0);
+        gp.min_p = req.value("min_p", 0.f);
+        gp.spec = req.value("spec", -1);
+        gp.seed = req.value("seed", (uint64_t) 0);
+        if (req.contains("stop_ids")) gp.stop_ids = req["stop_ids"].get<std::vector<int32_t>>();
+        if (req.contains("embd")) gp.embd = req["embd"];
+        gp.embd_key = req.value("embd_key", "");
+        ids = req.at("ids").get<std::vector<int32_t>>();
+    } catch (const std::exception& e) {
+        err = e.what();
+        return false;
+    }
+    return true;
 }
 
 int serve(Engine& eng) {
@@ -2557,21 +2753,10 @@ int serve(Engine& eng) {
                 continue;
             }
             Engine::GenParams gp;
-            gp.max_new = req.value("max_new", 256);
-            gp.temp = req.value("temp", 0.f);
-            gp.top_p = req.value("top_p", 1.f);
-            gp.top_k = req.value("top_k", 0);
-            gp.min_p = req.value("min_p", 0.f);
-            gp.spec = req.value("spec", -1);
-            gp.seed = req.value("seed", (uint64_t) 0);
-            if (req.contains("stop_ids")) gp.stop_ids = req["stop_ids"].get<std::vector<int32_t>>();
-            if (req.contains("embd")) gp.embd = req["embd"];
-            gp.embd_key = req.value("embd_key", "");
             std::vector<int32_t> ids;
-            try {
-                ids = req.at("ids").get<std::vector<int32_t>>();
-            } catch (const std::exception& e) {
-                out_line(std::string("ERR ") + e.what());
+            std::string err;
+            if (!parse_gen(req, gp, ids, err)) {
+                out_line("ERR " + err);
                 continue;
             }
             rd.stop.store(false);
@@ -2608,6 +2793,578 @@ int serve(Engine& eng) {
     }
     eng.save_heat();
     return 0;
+}
+
+// ------------------------------------------------------------------------------------------------ parallel serving
+// --parallel N (N > 1): up to N conversations at once, each in a slot with its own prompt cache; the latent KV is one
+// pool of 256-token pages that a conversation takes as it grows.  Every line about a request carries its id:
+//   in:  GEN {"id": "...", ...as above}   STOP <id>   INFO   SAVEHEAT   QUIT
+//   out: ADMIT <id> <slot> <reused>   PP <id> <done> <total> <reused>   W <id> <rows> <taken>   T <id> <tok>...
+//        DONE <id> {...}   ERR <id> <message>
+// The running conversations are decoded together: one window holds the next token (and the drafts) of each, so the
+// experts it reads serve them all.  The window's 16 rows are shared (16 / n - 1 drafts each); a prompt is read in
+// chunks of at most --pf-interleave tokens while others decode.
+int Engine::serve_parallel() {
+    const int S = (int) slots_.size(), V = hp_.n_vocab, E = hp_.n_embd;
+    if (S < 2 || !d_ptab_) fail("serve_parallel without slots");
+    struct Req {
+        std::string id;
+        GenParams gp;
+        std::vector<int32_t> prompt, hist, drafts, ed, out;
+        int slot = -1, state = 0;   // 0 waiting for a slot, 1 reading the prompt, 2 decoding
+        int a = 0, n_past = 0, spec = 0, src = 0, ke = 0, row0 = 0, e0 = 0;
+        bool use_eagle = false, stop = false, done = false, followed = false, eagle_try = false, chain = false,
+             from_eagle = false;
+        double acc_rate = 0.5, cum = 1.0;
+        GenStats st;
+        std::mt19937_64 rng;
+        Clock::time_point tp, tg;
+    };
+    std::deque<std::unique_ptr<Req>> reqs;   // arrival order
+    LineReader rd;
+    rd.start();
+    json ready = info();
+    out_line("READY " + ready.dump());
+    auto last_heat = Clock::now();
+    int32_t* const q_tok = pq_;                 // staging: window / EAGLE rows' tokens, positions, slots
+    int32_t* const q_pos = pq_ + kMaxWin;
+    int32_t* const q_slot = pq_ + 2 * kMaxWin;
+    int32_t* const rb_tok = pq_ + 3 * kMaxWin;  // read-back of the slots' draft chains
+    float* const rb_prob = reinterpret_cast<float*>(pq_ + 3 * kMaxWin + S * kMaxWin);
+
+    auto slots_json = [&]() {
+        json a = json::array();
+        for (int i = 0; i < S; ++i) {
+            const Slot& sl = slots_[(size_t) i];
+            std::string who;
+            for (const auto& r : reqs)
+                if (r->slot == i && !r->done) who = r->id;
+            a.push_back({{"slot", i}, {"busy", sl.busy}, {"id", who}, {"cached", sl.cached.size()},
+                         {"pages", sl.pages.size()}});
+        }
+        return a;
+    };
+    auto finish = [&](Req& r, const std::string& why) {
+        if (r.done) return;
+        r.done = true;
+        r.st.finish = why;
+        if (r.state == 2) r.st.gen_ms = ms_since(r.tg);
+        if (r.state == 1) r.st.prompt_ms = ms_since(r.tp);
+        if (r.slot >= 0) {
+            Slot& sl = slots_[(size_t) r.slot];
+            if (r.state == 2) {   // KV valid for hist[0 .. n_past)
+                sl.cached.assign(r.hist.begin(), r.hist.begin() + std::min<size_t>((size_t) r.n_past, r.hist.size()));
+                ngram_.learn(r.hist, (size_t) std::max(0, (int) r.prompt.size() - 3));
+            } else {              // the chunks read so far
+                sl.cached.assign(r.prompt.begin(), r.prompt.begin() + std::min<size_t>((size_t) r.a, r.prompt.size()));
+            }
+            sl.embd_key = r.gp.embd_key;
+            sl.eagle_ready = false;
+            trim_pages(r.slot, (int) sl.cached.size());
+            sl.busy = false;
+            sl.used = ++tick_;
+        }
+        const GenStats& st = r.st;
+        json d{{"n_prompt", st.n_prompt}, {"n_reused", st.n_reused}, {"n_gen", st.n_gen},
+               {"prompt_ms", st.prompt_ms}, {"gen_ms", st.gen_ms}, {"drafted", st.drafted},
+               {"accepted", st.accepted}, {"windows", st.windows}, {"eagle_drafted", st.e_drafted},
+               {"eagle_accepted", st.e_accepted}, {"eagle_windows", st.e_windows}, {"finish", st.finish},
+               {"slot", r.slot}};
+        out_line("DONE " + r.id + " " + d.dump());
+    };
+    auto start_decode = [&](Req& r) {
+        Slot& sl = slots_[(size_t) r.slot];
+        r.state = 2;
+        r.n_past = (int) r.prompt.size() - 1;
+        r.hist = r.prompt;
+        r.st.prompt_ms = ms_since(r.tp);
+        sl.cached.assign(r.prompt.begin(), r.prompt.end() - 1);
+        sl.embd_key = r.gp.embd_key;
+        if (r.use_eagle && r.followed) {   // the head followed the prompt: its first draft is the slot's
+            stash_first_draft(r.slot);
+            sl.eagle_ready = true;
+        }
+        r.tg = Clock::now();
+    };
+    // a slot for the oldest waiting request: the idle one with the longest usable prefix (>= 32 tokens), else the
+    // least recently used (empty slots first)
+    auto admit = [&](Req& r) -> bool {
+        const int n = (int) r.prompt.size();
+        int first_img = n;
+        if (r.gp.embd.is_array())
+            for (const auto& im : r.gp.embd)
+                for (const auto& row : im["rows"]) first_img = std::min(first_img, row.get<int>());
+        auto usable = [&](const Slot& sl) {
+            int m = 0;
+            while (m < (int) sl.cached.size() && m < n - 1 && sl.cached[(size_t) m] == r.prompt[(size_t) m]) ++m;
+            if (r.gp.embd_key != sl.embd_key && r.gp.embd.is_array()) m = std::min(m, first_img);
+            if (r.use_eagle) m = std::min(m, sl.eagle_valid);
+            return m;
+        };
+        int best = -1, best_m = -1, lru = -1;
+        for (int i = 0; i < S; ++i) {
+            const Slot& sl = slots_[(size_t) i];
+            if (sl.busy) continue;
+            const int m = usable(sl);
+            if (m > best_m) { best_m = m; best = i; }
+            if (lru < 0 || sl.used < slots_[(size_t) lru].used) lru = i;
+        }
+        if (lru < 0) return false;
+        const int si = best_m >= 32 ? best : lru;
+        Slot& sl = slots_[(size_t) si];
+        const int reuse = usable(sl);
+        if (!r.use_eagle) sl.eagle_valid = std::min(sl.eagle_valid, reuse);
+        sl.eagle_ready = false;
+        trim_pages(si, reuse);
+        sl.cached.resize((size_t) reuse);
+        sl.busy = true;
+        sl.used = ++tick_;
+        r.slot = si;
+        r.state = 1;
+        r.a = reuse;
+        r.st.n_reused = reuse;
+        r.tp = Clock::now();
+        out_line("ADMIT " + r.id + " " + std::to_string(si) + " " + std::to_string(reuse));
+        if (r.a >= n - 1) start_decode(r);
+        return true;
+    };
+    // one chunk of a prompt (at most cap tokens)
+    auto prompt_step = [&](Req& r, int cap) {
+        const int n = (int) r.prompt.size();
+        const int T = std::min({opt_.chunk, cap, n - 1 - r.a});
+        Slot& sl = slots_[(size_t) r.slot];
+        if (!ensure_pages(r.slot, r.a + T - 1)) {
+            logf_("parallel: no free KV pages for %s's prompt (all %d pages belong to running conversations)",
+                  r.id.c_str(), n_pages_);
+            finish(r, "context");
+            return;
+        }
+        const bool win = T <= kMaxWin && !(r.gp.embd.is_array() && !r.gp.embd.empty());
+        if (win) {
+            int32_t pos[kMaxWin], sl_of[kMaxWin];
+            for (int i = 0; i < T; ++i) { pos[i] = r.a + i; sl_of[i] = r.slot; }
+            run_window_rows(r.prompt.data() + r.a, pos, sl_of, T);
+        } else {
+            kvm_ = m4k::KvMap{d_ptab_ + (size_t) r.slot * n_pages_, n_pages_, nullptr};
+            prefill(r.prompt.data() + r.a, T, r.a, &r.gp, r.a, false);
+        }
+        if (r.use_eagle) {
+            eagle_valid_ = sl.eagle_valid;
+            eagle_follow(r.prompt.data() + r.a + 1, T, r.a, win);
+            sl.eagle_valid = eagle_valid_;
+            r.followed = true;
+        }
+        r.a += T;
+        CK(cudaStreamSynchronize(s_));
+        out_line("PP " + r.id + " " + std::to_string(r.a - r.st.n_reused) + " " +
+                 std::to_string(n - 1 - r.st.n_reused) + " " + std::to_string(r.st.n_reused));
+        if (r.a >= n - 1) start_decode(r);
+    };
+    // one window over every decoding conversation
+    auto decode_step = [&](std::vector<Req*>& act) {
+        const int nA = (int) act.size();
+        const int budget = std::max(0, kMaxWin / nA - 1);   // drafts per conversation: the rows are shared
+        // 1. drafts from the history lookup; pages for the window's rows
+        for (Req* r : act) {
+            Slot& sl = slots_[(size_t) r->slot];
+            r->drafts.clear();
+            r->ed.clear();
+            r->src = 0;
+            r->from_eagle = r->chain = r->eagle_try = false;
+            if (r->n_past + 1 >= opt_.ctx) { finish(*r, "context"); continue; }
+            int cap = std::min(budget, opt_.ctx - r->n_past - 2);
+            if (!ensure_pages(r->slot, r->n_past + std::max(0, cap))) {
+                if (!ensure_pages(r->slot, r->n_past)) {
+                    logf_("parallel: no free KV pages for %s (all %d pages belong to running conversations)",
+                          r->id.c_str(), n_pages_);
+                    finish(*r, "context");
+                    continue;
+                }
+                cap = std::min(cap, (int) sl.pages.size() * m4k::kPage - 1 - r->n_past);
+            }
+            cap = std::max(0, cap);
+            int room = std::min({r->spec, cap, std::max(0, r->gp.max_new - r->st.n_gen - 1)});
+            if (r->spec > 0) {   // adaptive drafting, as generate()
+                if (r->acc_rate >= 0.6) room = std::min(room, r->spec);
+                else if (r->acc_rate >= 0.4) room = std::min(room, std::max(1, r->spec / 2));
+                else if (r->acc_rate >= 0.2) room = std::min(room, 2);
+                else room = (r->st.windows % 8 == 0) ? std::min(room, 2) : 0;
+            }
+            ngram_.draft(r->hist, room, r->drafts, r->src);
+            if (r->src == 2 && (int) r->drafts.size() > std::max(1, room / 2)) r->drafts.resize((size_t) std::max(1, room / 2));
+            if (r->use_eagle && !(r->src == 1 && !r->drafts.empty())) {
+                r->eagle_try = true;
+                r->ke = std::max(0, std::min({opt_.eagle_k, r->gp.max_new - r->st.n_gen - 1, cap}));
+                r->chain = r->ke > 0 && sl.eagle_ready;
+                r->cum = 1.0;
+            }
+        }
+        // 2. EAGLE chains of all slots together: step 0 is each slot's first draft, every further step one EAGLE row
+        //    per slot (its last draft, at position n_past + j)
+        std::vector<Req*> ch;
+        for (Req* r : act)
+            if (!r->done && r->chain) ch.push_back(r);
+        if (!ch.empty()) {
+            auto read_back = [&]() {
+                CK(cudaMemcpyAsync(rb_tok, d_sdraft_, (size_t) S * kMaxWin * 4, cudaMemcpyDeviceToHost, s_));
+                CK(cudaMemcpyAsync(rb_prob, d_sprob_, (size_t) S * kMaxWin * 4, cudaMemcpyDeviceToHost, s_));
+                CK(cudaStreamSynchronize(s_));
+            };
+            read_back();
+            for (int j = 0; j < kMaxWin; ++j) {
+                std::vector<Req*> go;
+                for (Req* r : ch) {
+                    if (!r->chain) continue;
+                    const int32_t tok = rb_tok[r->slot * kMaxWin + j];
+                    r->cum *= rb_prob[r->slot * kMaxWin + j];
+                    if (r->cum < opt_.eagle_p || tok < 0 || tok >= V) { r->chain = false; continue; }
+                    r->ed.push_back(tok);
+                    if ((int) r->ed.size() >= r->ke) { r->chain = false; continue; }
+                    go.push_back(r);
+                }
+                if (go.empty()) break;
+                const int n = (int) go.size();
+                std::vector<int> dst((size_t) n);
+                for (int i = 0; i < n; ++i) {
+                    const Req* r = go[(size_t) i];
+                    q_tok[i] = r->ed.back();
+                    q_pos[i] = r->n_past + j;
+                    q_slot[i] = r->slot;
+                    dst[(size_t) i] = r->slot * kMaxWin + j + 1;
+                    CK(cudaMemcpyAsync(mh_ + (size_t) i * E, d_shid_ + (size_t) r->slot * E, (size_t) E * 4,
+                                       cudaMemcpyDeviceToDevice, s_));
+                }
+                CK(cudaMemcpyAsync(d_etok_, q_tok, (size_t) n * 4, cudaMemcpyHostToDevice, s_));
+                CK(cudaMemcpyAsync(d_erpos_, q_pos, (size_t) n * 4, cudaMemcpyHostToDevice, s_));
+                CK(cudaMemcpyAsync(d_erslot_, q_slot, (size_t) n * 4, cudaMemcpyHostToDevice, s_));
+                kvm_ = m4k::KvMap{d_ptab_, n_pages_, d_erslot_};
+                eagle_forward(d_etok_, mh_, n, 0, d_erpos_);
+                for (int i = 0; i < n; ++i)
+                    CK(cudaMemcpyAsync(d_shid_ + (size_t) go[(size_t) i]->slot * E, eh_ + (size_t) i * E, (size_t) E * 4,
+                                       cudaMemcpyDeviceToDevice, s_));
+                eagle_pick_rows(eh_, n, dst.data());
+                read_back();
+            }
+        }
+        for (Req* r : act) {
+            if (r->done) continue;
+            if (r->eagle_try && (!r->ed.empty() || r->src != 2)) {
+                r->drafts = r->ed;
+                r->from_eagle = true;
+                r->src = 3;
+            }
+            slots_[(size_t) r->slot].eagle_ready = false;   // the chain moved past the model's rows
+        }
+        // 3. the window (host arrays: the pinned staging may still feed the last EAGLE pass)
+        int T = 0;
+        int32_t wtok[kMaxWin], wpos[kMaxWin], sl_of[kMaxWin];
+        for (Req* r : act) {
+            if (r->done) continue;
+            r->row0 = T;
+            for (size_t i = 0; i <= r->drafts.size(); ++i) {
+                wtok[T] = i == 0 ? r->hist.back() : r->drafts[i - 1];
+                wpos[T] = r->n_past + (int) i;
+                sl_of[T] = r->slot;
+                ++T;
+            }
+        }
+        if (T == 0) return;
+        run_window_rows(wtok, wpos, sl_of, T);
+        // 4. what each conversation takes
+        bool any_greedy = false, any_sample = false;
+        for (Req* r : act)
+            if (!r->done) (r->gp.temp <= 0.f ? any_greedy : any_sample) = true;
+        int32_t am[kMaxWin];
+        if (any_greedy) {
+            m4k::argmax_rows(logits_, V, T, d_argmax_, s_);
+            CK(cudaMemcpyAsync(am, d_argmax_, (size_t) T * 4, cudaMemcpyDeviceToHost, s_));
+        }
+        if (any_sample)
+            CK(cudaMemcpyAsync(hlogits_.data(), logits_, (size_t) T * V * 4, cudaMemcpyDeviceToHost, s_));
+        CK(cudaStreamSynchronize(s_));
+        for (Req* r : act) {
+            if (r->done) continue;
+            r->out.clear();
+            const int n = 1 + (int) r->drafts.size();
+            for (int i = 0; i < n; ++i) {
+                const int row = r->row0 + i;
+                const int32_t y = r->gp.temp <= 0.f ? am[row] : sample(hlogits_.data() + (size_t) row * V, r->gp, r->rng);
+                r->out.push_back(y);
+                if (i + 1 < n && y == r->drafts[(size_t) i]) continue;
+                break;
+            }
+            GenStats& st = r->st;
+            ++st.windows;
+            st.drafted += (int) r->drafts.size();
+            st.accepted += (int) r->out.size() - 1;
+            if (r->from_eagle) {
+                st.e_drafted += (int) r->drafts.size();
+                st.e_accepted += (int) r->out.size() - 1;
+                ++st.e_windows;
+            } else if (!r->drafts.empty()) {
+                r->acc_rate = 0.7 * r->acc_rate + 0.3 * (double) ((int) r->out.size() - 1) / (double) r->drafts.size();
+            }
+            out_line("W " + r->id + " " + std::to_string(n) + " " + std::to_string(r->out.size()));
+        }
+        // 5. the EAGLE head follows every conversation over the rows that stay, in one pass
+        std::vector<Req*> fo;
+        int te = 0;
+        for (Req* r : act) {
+            if (r->done || !r->use_eagle) continue;
+            r->e0 = te;
+            for (size_t i = 0; i < r->out.size(); ++i) {
+                q_tok[te + (int) i] = r->out[i];
+                q_pos[te + (int) i] = r->n_past + (int) i;
+                q_slot[te + (int) i] = r->slot;
+            }
+            CK(cudaMemcpyAsync(mh_ + (size_t) te * E, xn_ + (size_t) r->row0 * E, r->out.size() * (size_t) E * 4,
+                               cudaMemcpyDeviceToDevice, s_));
+            te += (int) r->out.size();
+            fo.push_back(r);
+        }
+        if (te > 0) {
+            CK(cudaMemcpyAsync(d_etok_, q_tok, (size_t) te * 4, cudaMemcpyHostToDevice, s_));
+            CK(cudaMemcpyAsync(d_erpos_, q_pos, (size_t) te * 4, cudaMemcpyHostToDevice, s_));
+            CK(cudaMemcpyAsync(d_erslot_, q_slot, (size_t) te * 4, cudaMemcpyHostToDevice, s_));
+            kvm_ = m4k::KvMap{d_ptab_, n_pages_, d_erslot_};
+            eagle_forward(d_etok_, mh_, te, 0, d_erpos_);
+            std::vector<int> dst;
+            for (size_t q = 0; q < fo.size(); ++q) {
+                const Req* r = fo[q];
+                const float* last = eh_ + (size_t) (r->e0 + (int) r->out.size() - 1) * E;
+                CK(cudaMemcpyAsync(mh_ + q * (size_t) E, last, (size_t) E * 4, cudaMemcpyDeviceToDevice, s_));
+                CK(cudaMemcpyAsync(d_shid_ + (size_t) r->slot * E, last, (size_t) E * 4, cudaMemcpyDeviceToDevice, s_));
+                dst.push_back(r->slot * kMaxWin);
+            }
+            eagle_pick_rows(mh_, (int) fo.size(), dst.data());   // (the next chain reads back - a sync - before it
+            for (Req* r : fo) {                                   //  writes the staging these uploads read)
+                Slot& sl = slots_[(size_t) r->slot];
+                sl.eagle_ready = true;
+                if (r->n_past <= sl.eagle_valid) sl.eagle_valid = std::max(sl.eagle_valid, r->n_past + (int) r->out.size());
+            }
+        }
+        // 6. the KV rows of the taken tokens are final; out with them
+        for (Req* r : act) {
+            if (r->done) continue;
+            r->n_past += (int) r->out.size();
+            std::string line = "T " + r->id;
+            std::string why;
+            for (int32_t y : r->out) {
+                line += " " + std::to_string(y);
+                r->hist.push_back(y);
+                ++r->st.n_gen;
+                if (std::find(r->gp.stop_ids.begin(), r->gp.stop_ids.end(), y) != r->gp.stop_ids.end()) { why = "stop"; break; }
+                if (r->st.n_gen >= r->gp.max_new) { why = "length"; break; }
+            }
+            out_line(line);
+            if (!why.empty()) finish(*r, why);
+        }
+    };
+
+    bool quit = false;
+    while (!quit) {
+        // requests and commands
+        std::string line;
+        bool got = reqs.empty() ? rd.next(line) : rd.try_next(line);
+        if (!got && reqs.empty()) break;   // end of input
+        while (got) {
+            if (line.rfind("GEN ", 0) == 0) {
+                json j;
+                try {
+                    j = json::parse(line.substr(4));
+                } catch (const std::exception& e) {
+                    out_line(std::string("ERR - bad json: ") + e.what());
+                    got = rd.try_next(line);
+                    continue;
+                }
+                auto r = std::make_unique<Req>();
+                r->id = j.value("id", "");
+                std::string err;
+                bool dup = false;
+                for (const auto& o : reqs) dup |= !o->done && o->id == r->id;
+                if (r->id.empty() || r->id.find_first_of(" \t") != std::string::npos) out_line("ERR - a request needs an id without spaces");
+                else if (dup) out_line("ERR " + r->id + " id in use");
+                else if (!parse_gen(j, r->gp, r->prompt, err)) out_line("ERR " + r->id + " " + err);
+                else {
+                    r->st.n_prompt = (int) r->prompt.size();
+                    r->spec = r->gp.spec >= 0 ? std::min(r->gp.spec, kMaxWin - 1) : opt_.spec;
+                    r->use_eagle = eagle_on_ && r->spec > 0;
+                    r->rng.seed(r->gp.seed ? r->gp.seed : (uint64_t) std::random_device{}());
+                    if (r->prompt.empty()) finish(*r, "error");
+                    else if ((int) r->prompt.size() + kMaxWin >= opt_.ctx) finish(*r, "context");
+                    else reqs.push_back(std::move(r));
+                }
+            } else if (line.rfind("STOP ", 0) == 0) {
+                const std::string id = line.substr(5);
+                for (auto& r : reqs)
+                    if (r->id == id) r->stop = true;
+            } else if (line == "INFO") {
+                json in = info();
+                in["slots"] = slots_json();
+                in["free_pages"] = free_pages_.size();
+                out_line("INFO " + in.dump());
+            } else if (line == "SAVEHEAT") {
+                save_heat();
+                out_line("OK");
+            } else if (line == "QUIT") {
+                quit = true;
+            } else if (!line.empty()) {
+                out_line("ERR - unknown command");
+            }
+            got = rd.try_next(line);
+        }
+        if (rd.stop.exchange(false) || quit || rd.eof.load())   // a bare STOP (or the end): every request
+            for (auto& r : reqs) r->stop = true;
+        auto sweep = [&]() {
+            for (auto& r : reqs)
+                if (r->stop) finish(*r, "abort");
+            reqs.erase(std::remove_if(reqs.begin(), reqs.end(), [](const std::unique_ptr<Req>& r) { return r->done; }),
+                       reqs.end());
+        };
+        sweep();
+        // slots for the waiting, oldest first
+        for (auto& r : reqs)
+            if (r->state == 0 && !admit(*r)) break;
+        sweep();
+        // a chunk of the oldest prompt being read (shorter while others decode)
+        bool decoding = false;
+        for (auto& r : reqs) decoding |= r->state == 2;
+        for (auto& r : reqs)
+            if (r->state == 1) {
+                prompt_step(*r, decoding ? opt_.pf_interleave : opt_.chunk);
+                break;
+            }
+        sweep();
+        // a window over every conversation decoding
+        std::vector<Req*> act;
+        for (auto& r : reqs)
+            if (r->state == 2) act.push_back(r.get());
+        if (!act.empty()) decode_step(act);
+        sweep();
+        if (ms_since(last_heat) > 300000) {
+            save_heat();
+            last_heat = Clock::now();
+        }
+        if (rd.eof.load() && reqs.empty()) break;
+    }
+    save_heat();
+    return 0;
+}
+
+// Paged KV (--parallel): two conversations whose rows sit in scrambled pages of one pool.  The KV write, the decode
+// kernels (rows of both conversations in one window) and the prompt gather against the same caches stored contiguously.
+int selftest_paged(cudaStream_t s) {
+    const int H = 32, D = m4k::kKD, LAT = m4k::kLat, PG = m4k::kPage, NP = 9;
+    const float scale = 0.19497f;
+    std::mt19937 rng(11);
+    std::normal_distribution<float> nd(0.f, 1.f);
+    const int n_of[2] = {700, 300};                        // conversation lengths
+    const std::vector<std::vector<int>> pages = {{5, 2, 7}, {0, 6}};
+    std::vector<int32_t> ptab((size_t) 2 * NP, 0);
+    for (int c = 0; c < 2; ++c)
+        for (size_t i = 0; i < pages[(size_t) c].size(); ++i) ptab[(size_t) c * NP + i] = pages[(size_t) c][i];
+    std::vector<float> rope((size_t) (1024 + 16) * 64);
+    m4k::rope_table_host(rope.data(), 1024 + 16, 64, 10000.f, 1.f, 0.f, 1.f, 32.f, 1.f, 4096);
+    std::vector<float> norm((size_t) LAT, 1.f);
+    float *d_rope = nullptr, *d_norm = nullptr, *d_kvp = nullptr;
+    int32_t *d_ptab = nullptr, *d_pos = nullptr, *d_rs = nullptr;
+    CK(cudaMalloc(&d_rope, rope.size() * 4));
+    CK(cudaMemcpy(d_rope, rope.data(), rope.size() * 4, cudaMemcpyHostToDevice));
+    CK(cudaMalloc(&d_norm, norm.size() * 4));
+    CK(cudaMemcpy(d_norm, norm.data(), norm.size() * 4, cudaMemcpyHostToDevice));
+    CK(cudaMalloc(&d_ptab, ptab.size() * 4));
+    CK(cudaMemcpy(d_ptab, ptab.data(), ptab.size() * 4, cudaMemcpyHostToDevice));
+    CK(cudaMalloc(&d_kvp, (size_t) 1024 * D * 4));
+    CK(cudaMalloc(&d_pos, 1024 * 4));
+    CK(cudaMalloc(&d_rs, 16 * 4));
+    int fails = 0;
+    for (int kv_mode : {m4k::KV_F16, m4k::KV_I8}) {
+        const size_t rb = kv_mode == m4k::KV_F16 ? (size_t) D * 2 : (size_t) D;
+        void *pool = nullptr, *flat[2] = {nullptr, nullptr};
+        float *pool_s = nullptr, *flat_s[2] = {nullptr, nullptr};
+        CK(cudaMalloc(&pool, (size_t) NP * PG * rb));
+        CK(cudaMemset(pool, 0x5a, (size_t) NP * PG * rb));   // poison: a wrong row shows
+        CK(cudaMalloc(&pool_s, (size_t) NP * PG * 8));
+        CK(cudaMemset(pool_s, 0x5a, (size_t) NP * PG * 8));
+        // 1. the write: each conversation's rows through the KV write, into its flat cache and into the pool
+        for (int c = 0; c < 2; ++c) {
+            const int n = n_of[c];
+            CK(cudaMalloc(&flat[c], (size_t) n * rb));
+            CK(cudaMalloc(&flat_s[c], (size_t) n * 8));
+            std::vector<float> kvp((size_t) n * D);
+            for (int r = 0; r < n; ++r)
+                for (int d = 0; d < D; ++d) kvp[(size_t) r * D + d] = nd(rng) * (d < LAT ? 0.05f : 3.f);
+            std::vector<int32_t> pos((size_t) n);
+            std::iota(pos.begin(), pos.end(), 0);
+            CK(cudaMemcpy(d_kvp, kvp.data(), kvp.size() * 4, cudaMemcpyHostToDevice));
+            CK(cudaMemcpy(d_pos, pos.data(), pos.size() * 4, cudaMemcpyHostToDevice));
+            m4k::mla_kv_write(d_kvp, d_norm, d_rope, d_pos, n, kv_mode, flat[c], flat_s[c], 1e-6f, s);
+            m4k::mla_kv_write(d_kvp, d_norm, d_rope, d_pos, n, kv_mode, pool, pool_s, 1e-6f, s,
+                              m4k::KvMap{d_ptab + (size_t) c * NP, NP, nullptr});
+        }
+        CK(cudaStreamSynchronize(s));
+        // 2. the prompt gather of each conversation from the pool = its flat cache
+        for (int c = 0; c < 2; ++c) {
+            const int n = n_of[c];
+            __half *a = nullptr, *b = nullptr;
+            CK(cudaMalloc(&a, (size_t) n * D * 2));
+            CK(cudaMalloc(&b, (size_t) n * D * 2));
+            m4k::mla_cache_to_f16(flat[c], flat_s[c], kv_mode, n, a, s);
+            m4k::mla_cache_to_f16(pool, pool_s, kv_mode, n, b, s, m4k::KvMap{d_ptab + (size_t) c * NP, NP, nullptr});
+            std::vector<__half> ha((size_t) n * D), hb(ha.size());
+            CK(cudaMemcpy(ha.data(), a, ha.size() * 2, cudaMemcpyDeviceToHost));
+            CK(cudaMemcpy(hb.data(), b, hb.size() * 2, cudaMemcpyDeviceToHost));
+            const bool ok = std::memcmp(ha.data(), hb.data(), ha.size() * 2) == 0;
+            fails += !ok;
+            std::printf("paged %s conversation %d (%d rows): write + gather %s\n", kv_mode == m4k::KV_F16 ? "f16 " : "int8", c,
+                        n, ok ? "identical" : "DIFFERENT - FAIL");
+            CK(cudaFree(a));
+            CK(cudaFree(b));
+        }
+        // 3. one window with rows of both conversations (3 of the first, 2 of the second) against each one alone
+        const int T = 5;
+        const int rs[T] = {0, 0, 0, 1, 1};
+        const int ps[T] = {n_of[0] - 3, n_of[0] - 2, n_of[0] - 1, n_of[1] - 2, n_of[1] - 1};
+        std::vector<float> Q((size_t) T * H * D);
+        for (auto& v : Q) v = nd(rng) * 2.f;
+        float *dQ = nullptr, *part = nullptr, *O = nullptr, *Oc = nullptr;
+        CK(cudaMalloc(&dQ, Q.size() * 4));
+        CK(cudaMemcpy(dQ, Q.data(), Q.size() * 4, cudaMemcpyHostToDevice));
+        CK(cudaMalloc(&part, m4k::mla_decode_part_floats(T, H) * 4));
+        CK(cudaMalloc(&O, (size_t) T * H * LAT * 4));
+        CK(cudaMalloc(&Oc, (size_t) T * H * LAT * 4));
+        CK(cudaMemcpy(d_rs, rs, sizeof rs, cudaMemcpyHostToDevice));
+        CK(cudaMemcpy(d_pos, ps, sizeof ps, cudaMemcpyHostToDevice));
+        for (int impl : {m4k::ATTN_SIMT, m4k::ATTN_TC}) {
+            m4k::mla_attn_decode(dQ, pool, pool_s, kv_mode, d_pos, T, H, scale, part, O, s, impl, m4k::KvMap{d_ptab, NP, d_rs});
+            // each conversation's rows alone on its flat cache
+            for (int c = 0, t0 = 0; c < 2; ++c) {
+                const int nt = c == 0 ? 3 : 2;
+                m4k::mla_attn_decode(dQ + (size_t) t0 * H * D, flat[c], flat_s[c], kv_mode, d_pos + t0, nt, H, scale, part,
+                                     Oc + (size_t) t0 * H * LAT, s, impl);
+                t0 += nt;
+            }
+            CK(cudaStreamSynchronize(s));
+            std::vector<float> a((size_t) T * H * LAT), b(a.size());
+            CK(cudaMemcpy(a.data(), O, a.size() * 4, cudaMemcpyDeviceToHost));
+            CK(cudaMemcpy(b.data(), Oc, b.size() * 4, cudaMemcpyDeviceToHost));
+            double e = 0, mag = 0;
+            for (size_t i = 0; i < a.size(); ++i) {
+                e = std::max(e, (double) std::fabs(a[i] - b[i]));
+                mag = std::max(mag, (double) std::fabs(b[i]));
+            }
+            const bool ok = std::isfinite(e) && e <= 1e-3 * mag + 1e-6;
+            fails += !ok;
+            std::printf("paged %s window of both conversations (%s): max diff %.2e of %.4f %s\n",
+                        kv_mode == m4k::KV_F16 ? "f16 " : "int8", impl == m4k::ATTN_TC ? "tc  " : "simt", e, mag,
+                        ok ? "ok" : "FAIL");
+        }
+        for (void* p : {(void*) dQ, (void*) part, (void*) O, (void*) Oc, pool, (void*) pool_s, flat[0], flat[1],
+                        (void*) flat_s[0], (void*) flat_s[1]})
+            CK(cudaFree(p));
+    }
+    for (void* p : {(void*) d_rope, (void*) d_norm, (void*) d_kvp, (void*) d_ptab, (void*) d_pos, (void*) d_rs}) CK(cudaFree(p));
+    return fails;
 }
 
 // ------------------------------------------------------------------------------------------------ attention self-test
@@ -2738,6 +3495,7 @@ int selftest_attn(int gpu) {
             }
         }
     }
+    fails += selftest_paged(s);
     // speed at long contexts (int8 cache, random rows): both decode kernels, per layer and per token (36 layers)
     for (int n_kv : {4096, 16384, 32768, 65536}) {
         for (int T : {1, 4}) {
@@ -2803,7 +3561,7 @@ int run(int argc, char** argv) {
     if (o.mode == "selftest-attn") return selftest_attn(o.gpu);
     Engine eng(o);
     eng.load();
-    if (o.mode == "serve") return serve(eng);
+    if (o.mode == "serve") return o.parallel > 1 ? eng.serve_parallel() : serve(eng);
     if (o.mode == "eagle-acc") {
         std::ifstream f(o.ids_file);
         std::vector<int32_t> ids;

@@ -180,7 +180,7 @@ say "Python environment for m4serve"
 if [[ -f "$REPO/terminal/requirements-monitor.txt" ]]; then
   "$PREFIX/venv/bin/pip" install -q -r "$REPO/terminal/requirements-monitor.txt" || echo "note: textual for strata monitor not installed"
 fi
-cp "$HERE/m4serve.py" "$HERE/m4cli.py" "$HERE/bench.sh" "$HERE/parity.sh" "$HERE/sanity.sh" "$HERE/speed.sh" "$HERE/longctx.sh" "$HERE/start-m4.sh" "$HERE/monitor-m4.sh" "$PREFIX/"
+cp "$HERE/m4serve.py" "$HERE/m4cli.py" "$HERE/bench.sh" "$HERE/parity.sh" "$HERE/sanity.sh" "$HERE/speed.sh" "$HERE/longctx.sh" "$HERE/start-m4.sh" "$HERE/monitor-m4.sh" "$HERE/parallel_check.py" "$PREFIX/"
 chmod +x "$PREFIX/bench.sh" "$PREFIX/parity.sh" "$PREFIX/sanity.sh" "$PREFIX/speed.sh" "$PREFIX/longctx.sh" "$PREFIX/start-m4.sh" "$PREFIX/monitor-m4.sh"
 # the `strata-m4` command (launch, serve, stop, status, monitor, logs, config, doctor, bench ...) on the PATH
 mkdir -p "$HOME/.local/bin"
@@ -205,6 +205,8 @@ M4_TOKENIZER=${TOKENIZER}
 M4_ENGINE_ARGS="--ctx 65536 --kv int8 --spec 6 --numa split"
 M4_HOST=127.0.0.1
 M4_PORT=8095
+# conversations at once (1-8): they share the KV cache of --ctx, each takes pages as it grows (strata-m4 launch --parallel N)
+# M4_PARALLEL=1
 # M4_API_KEY=change-me
 M4_LLAMA=$PREFIX/src/llama.cpp/build/bin
 EOF
@@ -221,7 +223,7 @@ After=network.target
 [Service]
 User=$USER
 EnvironmentFile=$ENVF
-ExecStart=/bin/bash -c 'exec $PREFIX/venv/bin/python $PREFIX/m4serve.py --engine $PREFIX/bin/strata-m4 --model "\$M4_MODEL" --tokenizer "\$M4_TOKENIZER" \${M4_MMPROJ:+--mmproj "\$M4_MMPROJ" --vision $PREFIX/bin/m4-vision} --engine-args "\$M4_ENGINE_ARGS" --host "\$M4_HOST" --port "\$M4_PORT"'
+ExecStart=/bin/bash -c 'exec $PREFIX/venv/bin/python $PREFIX/m4serve.py --engine $PREFIX/bin/strata-m4 --model "\$M4_MODEL" --tokenizer "\$M4_TOKENIZER" \${M4_MMPROJ:+--mmproj "\$M4_MMPROJ" --vision $PREFIX/bin/m4-vision} --engine-args "\$M4_ENGINE_ARGS" --host "\$M4_HOST" --port "\$M4_PORT" \${M4_PARALLEL:+--parallel \$M4_PARALLEL}'
 Restart=on-failure
 RestartSec=10
 LimitMEMLOCK=infinity
