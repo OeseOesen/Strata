@@ -104,6 +104,24 @@ Experten nach f16 entpackt und Gate/Up, SwiGLU und Down als Tensor-Core-GEMMs re
 1300 tok/s.  Kleinere Abschnitte (Agenten-Schritte) rechnet weiter der CPU-Pool.  Dichte Produkte ab 64 Zeilen laufen
 ebenfalls als f16-GEMM (`--pf-gemm`).  Schalter: `--pf-stream 0|1`, `--pf-min N`, `--pf-ring N`, `--chunk N`.
 
+## Der Befehl `strata-m4`
+
+`install.sh` legt `~/.local/bin/strata-m4` an (wie Stratas `strata`):
+
+| Befehl | Was er tut |
+|---|---|
+| `strata-m4 launch` | Server im Hintergrund starten (falls er nicht läuft), auf Bereitschaft warten, Monitor öffnen; `--no-monitor` nur starten |
+| `strata-m4 serve` | Server im Vordergrund (Strg+C beendet) |
+| `strata-m4 stop` / `restart` | sauber beenden (SIGINT, nach 30 s erzwungen) / neu starten |
+| `strata-m4 status [--json]` | Zustand, Modell, Kontext, Warteschlange, Tempo, GPU, Platzierung |
+| `strata-m4 monitor [--once]` | Stratas Monitor mit Port und Key aus `m4.env` |
+| `strata-m4 logs [-f]` | Server-Log (`~/strata-m4/logs/server.log`) |
+| `strata-m4 config show \| edit \| set NAME WERT \| args add\|remove OPTION [WERT]` | `m4.env` ansehen/ändern (Key wird verdeckt) |
+| `strata-m4 doctor` | Prüfungen: GPU, Dateien, venv, Monitor, Port, PATH |
+| `strata-m4 bench \| speed \| sanity \| parity \| longctx` | Messskripte (nur bei gestopptem Server) |
+
+Beispiele: `strata-m4 config args add --chunk 4096`, `strata-m4 config set M4_PORT 8095`, danach `strata-m4 restart`.
+
 ## Strata Monitor
 
 m4serve liefert Strata's Telemetrie-Schnittstelle (`GET /v1/telemetry`, Schema 1, und `/v1/status`). Der Monitor aus dem
