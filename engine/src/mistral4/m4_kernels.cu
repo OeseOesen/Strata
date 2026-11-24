@@ -705,20 +705,49 @@ __global__ void argmax_prob_kernel(const float* x, int n, int32_t* out, float* p
     }
 }
 
-__global__ void gather_rows_f16_kernel(const float* x, const int32_t* rows, int cols, __half* out) {
+// f16 GEMM operands: a row whose largest value would not fit f16 (the first token's "massive activations" reach
+// 1e4 and more in some FFN channels; f16 ends at 65504) is scaled down by a power-free factor and the GEMM's output row
+// scaled back (inv[i]); every other row is converted as it is (inv 1).
+constexpr float kF16Room = 16384.f;
+
+__global__ void rows_f16_scaled_kernel(const float* x, const int32_t* rows, int cols, __half* out, float* inv) {
+    __shared__ float red[32];
     const int i = blockIdx.x;
-    const float* src = x + (size_t) rows[i] * cols;
+    const float* src = x + (size_t) (rows ? rows[i] : i) * cols;
+    float m = 0.f;
+    for (int d = threadIdx.x; d < cols; d += blockDim.x) m = fmaxf(m, fabsf(src[d]));
+    m = block_max(m, red);
+    const float sc = m > kF16Room ? kF16Room / m : 1.f;
     __half* dst = out + (size_t) i * cols;
-    for (int d = threadIdx.x; d < cols; d += blockDim.x) dst[d] = __float2half(src[d]);
+    for (int d = threadIdx.x; d < cols; d += blockDim.x) dst[d] = __float2half(src[d] * sc);
+    if (threadIdx.x == 0) inv[i] = 1.f / sc;
 }
 
-__global__ void swiglu_f16_kernel(const float* gu, int F, __half* h) {
+// h = silu(g) * u of the gate/up GEMM's rows (scaled by inv_in, which this undoes), written as f16 with its own scale
+__global__ void swiglu_f16_scaled_kernel(const float* gu, const float* inv_in, int F, __half* h, float* inv_out) {
+    __shared__ float red[32];
     const int i = blockIdx.x;
     const float* g = gu + (size_t) i * 2 * F;
+    const float s = inv_in ? inv_in[i] : 1.f;
+    float m = 0.f;
     for (int f = threadIdx.x; f < F; f += blockDim.x) {
-        const float a = g[f];
-        h[(size_t) i * F + f] = __float2half(a / (1.f + __expf(-a)) * g[F + f]);
+        const float a = g[f] * s;
+        m = fmaxf(m, fabsf(a / (1.f + __expf(-a)) * g[F + f] * s));
     }
+    m = block_max(m, red);
+    const float sc = m > kF16Room ? kF16Room / m : 1.f;
+    for (int f = threadIdx.x; f < F; f += blockDim.x) {
+        const float a = g[f] * s;
+        h[(size_t) i * F + f] = __float2half(a / (1.f + __expf(-a)) * g[F + f] * s * sc);
+    }
+    if (threadIdx.x == 0) inv_out[i] = 1.f / sc;
+}
+
+__global__ void scale_rows_kernel(float* y, int cols, const float* inv) {
+    const float s = inv[blockIdx.x];
+    if (s == 1.f) return;
+    float* r = y + (size_t) blockIdx.x * cols;
+    for (int d = threadIdx.x; d < cols; d += blockDim.x) r[d] *= s;
 }
 
 }  // namespace
@@ -888,16 +917,22 @@ void argmax_prob(const float* x, int n, int32_t* out, float* prob, cudaStream_t 
     check("argmax_prob");
 }
 
-void gather_rows_f16(const float* x, const int32_t* rows, int n, int cols, __half* out, cudaStream_t s) {
+void rows_f16_scaled(const float* x, const int32_t* rows, int n, int cols, __half* out, float* inv, cudaStream_t s) {
     if (n <= 0) return;
-    gather_rows_f16_kernel<<<n, 256, 0, s>>>(x, rows, cols, out);
-    check("gather_rows_f16");
+    rows_f16_scaled_kernel<<<n, 256, 0, s>>>(x, rows, cols, out, inv);
+    check("rows_f16_scaled");
 }
 
-void swiglu_f16(const float* gu, int n, int F, __half* h, cudaStream_t s) {
+void swiglu_f16_scaled(const float* gu, const float* inv_in, int n, int F, __half* h, float* inv_out, cudaStream_t s) {
     if (n <= 0) return;
-    swiglu_f16_kernel<<<n, 256, 0, s>>>(gu, F, h);
-    check("swiglu_f16");
+    swiglu_f16_scaled_kernel<<<n, 256, 0, s>>>(gu, inv_in, F, h, inv_out);
+    check("swiglu_f16_scaled");
+}
+
+void scale_rows(float* y, int n, int cols, const float* inv, cudaStream_t s) {
+    if (n <= 0) return;
+    scale_rows_kernel<<<n, 256, 0, s>>>(y, cols, inv);
+    check("scale_rows");
 }
 
 }  // namespace m4k
