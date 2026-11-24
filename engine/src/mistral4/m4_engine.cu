@@ -497,6 +497,7 @@ private:
     void moe_prefill(int l, int T);
     void moe_prefill_stream(int l, int T);
     bool stream_ok(const Layer& L) const;
+    void check_ids(int l, const int32_t* ids, int R) const;
     void ensure_w16(size_t elems);
     void ensure_x16(size_t elems);
     void register_arenas();
@@ -565,6 +566,7 @@ private:
     __half *W16_ = nullptr, *X16_ = nullptr, *H16_ = nullptr;
     size_t W16_elems_ = 0, X16_elems_ = 0;
     float* GU_ = nullptr;
+    float *d_xinv_ = nullptr, *d_hinv_ = nullptr;   // per-row unscale factors of the f16 GEMM operands
     int32_t *d_rpos_ = nullptr, *d_noslot_ = nullptr, *d_rows_ = nullptr, *prpos_ = nullptr, *prows_ = nullptr;
     bool pinned_arenas_ = false;
     double pf_stream_bytes_ = 0;
@@ -958,6 +960,8 @@ void Engine::alloc_buffers() {
               (double) opt_.pf_ring * ring_stride_ / GiB);
     }
     if (opt_.pf_stream || opt_.pf_gemm) {
+        CK(cudaMalloc(&d_xinv_, T * 4));
+        CK(cudaMalloc(&d_hinv_, T * 4));
         ensure_w16((size_t) 2 * hp_.n_ff * E);
         ensure_x16((size_t) T * std::max(E, H * hp_.v_dim));
     }
@@ -1347,16 +1351,17 @@ void Engine::mm(const Mat& m, const float* x, const void* xq, float* y, int T, c
         CB(cublasSgemm(cb_, CUBLAS_OP_T, CUBLAS_OP_N, m.n_out, T, m.n_in, &one, m.f, m.n_in, x, m.n_in, &zero, y, m.n_out));
         return;
     }
-    if (opt_.pf_gemm && T >= 64 && K::dequant_bf16_supported(m.type)) {
+    if (opt_.pf_gemm && d_xinv_ && T >= 64 && T <= Tm_ && K::dequant_bf16_supported(m.type)) {
         // a prompt chunk: the weights dequantized to f16 once, one tensor-core GEMM (the q8_1 path would read the
         // weights T/8 times)
         const float one = 1.f, zero = 0.f;
         ensure_w16((size_t) m.n_in * m.n_out);
         ensure_x16((size_t) T * m.n_in);
         K::dequant_f16(m.type, m.d, 0, m.n_out, m.n_in, (uint16_t*) W16_, s);
-        m4k::f32_to_f16_scaled(x, X16_, (size_t) T * m.n_in, 1.f, s);
+        m4k::rows_f16_scaled(x, nullptr, T, m.n_in, X16_, d_xinv_, s);   // rows past f16's range scaled down
         CB(cublasGemmEx(cb_, CUBLAS_OP_T, CUBLAS_OP_N, m.n_out, T, m.n_in, &one, W16_, CUDA_R_16F, m.n_in, X16_, CUDA_R_16F,
                         m.n_in, &zero, y, CUDA_R_32F, m.n_out, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+        m4k::scale_rows(y, T, m.n_out, d_xinv_, s);                    // ... and back
         return;
     }
     const size_t col = q8_bytes(m.n_in, 1);
@@ -1525,6 +1530,7 @@ void Engine::moe_prefill(int l, int T) {
     CK(cudaMemcpyAsync(pids_, d_ids_, (size_t) R * 4, cudaMemcpyDeviceToHost, s_));
     CK(cudaMemcpyAsync(px_, xn_, (size_t) T * E * 4, cudaMemcpyDeviceToHost, s_));
     CK(cudaStreamSynchronize(s_));
+    check_ids(l, pids_, R);
     count_heat(l, pids_, R);
     // the CPU's routes, grouped by expert; compact output rows
     call_.clear();
@@ -1605,6 +1611,15 @@ void Engine::head(int from, int n) {
 // a copy stream (the split policy's halves reassembled on the way), while the compute stream dequantizes each expert
 // to f16 and runs gate/up, SwiGLU and down as tensor-core GEMMs over the expert's rows.  PCIe Gen3 x16 moves the
 // ~37 GB of CPU experts in ~3 s, so a 2048-token chunk reads at ~700 tok/s, 4096 at ~1300 (the copies dominate).
+/// Router ids before the host indexes anything with them: a NaN in the layer's input makes every logit NaN and the
+/// top-k's argmax keeps its 0x7fffffff - a clear message instead of a segfault in the grouping.
+void Engine::check_ids(int l, const int32_t* ids, int R) const {
+    for (int r = 0; r < R; ++r)
+        if (ids[r] < 0 || ids[r] >= hp_.n_expert)
+            fail("layer " + std::to_string(l) + ": the router returned expert " + std::to_string(ids[r]) + " for route " +
+                 std::to_string(r) + " (NaN or inf in the hidden state)");
+}
+
 bool Engine::stream_ok(const Layer& L) const {
     return opt_.pf_stream && ring_ && !L.dense && K::dequant_bf16_supported(L.gu_type) &&
            K::dequant_bf16_supported(L.d_type);
@@ -1619,6 +1634,7 @@ void Engine::moe_prefill_stream(int l, int T) {
     m4k::router_topk(rlog_, L.probs_b, NE, k, T, hp_.gating, hp_.w_norm, hp_.w_scale, d_ids_, w_, s_);
     CK(cudaMemcpyAsync(pids_, d_ids_, (size_t) R * 4, cudaMemcpyDeviceToHost, s_));
     CK(cudaStreamSynchronize(s_));
+    check_ids(l, pids_, R);
     count_heat(l, pids_, R);
     // the routes sorted by expert: prows_[i] = the token of sorted route i, prpos_[route] = its sorted row
     std::vector<int> cnt((size_t) NE + 1, 0), off((size_t) NE + 1, 0);
@@ -1681,17 +1697,18 @@ void Engine::moe_prefill_stream(int l, int T) {
     // one expert: rows [off[e], off[e]+n) of the sorted routes -> cpu_parts_ rows of the same indices
     auto compute = [&](int e, const uint8_t* blob, size_t uo, size_t dof) {
         const int n = cnt[(size_t) e], o = off[(size_t) e];
-        m4k::gather_rows_f16(xn_, d_rows_ + o, n, E, X16_, s_);
+        m4k::rows_f16_scaled(xn_, d_rows_ + o, n, E, X16_, d_xinv_, s_);
         K::dequant_f16(L.gu_type, blob, 0, F, E, (uint16_t*) W16_, s_);
         K::dequant_f16(L.gu_type, blob + uo, 0, F, E, (uint16_t*) W16_ + (size_t) F * E, s_);
         // GU[n][2F] = X W_gu^T
         CB(cublasGemmEx(cb_, CUBLAS_OP_T, CUBLAS_OP_N, 2 * F, n, E, &one, W16_, CUDA_R_16F, E, X16_, CUDA_R_16F, E, &zero,
                         GU_, CUDA_R_32F, 2 * F, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
-        m4k::swiglu_f16(GU_, n, F, H16_, s_);
+        m4k::swiglu_f16_scaled(GU_, d_xinv_, n, F, H16_, d_hinv_, s_);
         K::dequant_f16(L.d_type, blob + dof, 0, E, F, (uint16_t*) W16_, s_);
         // D[n][E] = H W_down^T
         CB(cublasGemmEx(cb_, CUBLAS_OP_T, CUBLAS_OP_N, E, n, F, &one, W16_, CUDA_R_16F, F, H16_, CUDA_R_16F, F, &zero,
                         cpu_parts_ + (size_t) o * E, CUDA_R_32F, E, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+        m4k::scale_rows(cpu_parts_ + (size_t) o * E, n, E, d_hinv_, s_);
     };
     for (int e : resident) compute(e, L.slots + (size_t) L.slot_of[(size_t) e] * L.stride, L.L.up_off, L.L.down_off);
     for (int j = 0; j < (int) streamed.size(); ++j) {
@@ -2041,6 +2058,7 @@ void Engine::serve_host_layers(int T) {
             if (ms_since(t0) > 60000) fail("no routes from the GPU for layer " + std::to_string(l) + " after 60 s");
         }
         std::atomic_thread_fence(std::memory_order_acquire);
+        check_ids(l, hids_, R);
         count_heat(l, hids_, R);
         call_.clear();
         call_.x = hx_;

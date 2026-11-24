@@ -89,9 +89,14 @@ void concat2(const float* a, const float* b, float* out, int n, int rows, cudaSt
 /// One row: the first maximum and its softmax probability.
 void argmax_prob(const float* x, int n, int32_t* out, float* prob, cudaStream_t s);
 
-/// Prompt experts on the tensor cores: out[i] = f16(x[rows[i]]) (rows of `cols` floats).
-void gather_rows_f16(const float* x, const int32_t* rows, int n, int cols, __half* out, cudaStream_t s);
-/// h[i][f] = f16(silu(gu[i][f]) * gu[i][F + f]) for rows of [gate | up] (2F floats).
-void swiglu_f16(const float* gu, int n, int F, __half* h, cudaStream_t s);
+/// f16 operands of the prompt GEMMs, safe for the first token's massive activations (f16 ends at 65504; an overflow
+/// became inf, then NaN, then a router id of 0x7fffffff): out[i] = f16(x[rows ? rows[i] : i] * sc_i) with sc_i < 1
+/// only for a row whose largest |value| exceeds 16384, inv[i] = 1 / sc_i for scale_rows on the GEMM's output.
+void rows_f16_scaled(const float* x, const int32_t* rows, int n, int cols, __half* out, float* inv, cudaStream_t s);
+/// h[i][f] = silu(g) * u of [gate | up] rows (2F floats each, scaled by inv_in[i], undone here; inv_in may be null)
+/// as f16 with its own row scale (inv_out).
+void swiglu_f16_scaled(const float* gu, const float* inv_in, int n, int F, __half* h, float* inv_out, cudaStream_t s);
+/// y[i][:] *= inv[i] (rows of `cols` floats; rows with inv 1 untouched).
+void scale_rows(float* y, int n, int cols, const float* inv, cudaStream_t s);
 
 }  // namespace m4k
