@@ -23,6 +23,7 @@ import base64
 import collections
 import hashlib
 import json
+import re
 import os
 import queue
 import shlex
@@ -454,7 +455,7 @@ class Chat:
     def _dec(self, x: list[int]) -> str:
         return self.tok.decode(x, special_token_policy=SpecialTokenPolicy.IGNORE) if x else ""
 
-    def split(self, ids: list[int], finish: str | None = None):
+    def split(self, ids: list[int], finish: str | None = None, tools: list | None = None):
         """-> (content, reasoning, tool_calls).  finish: the engine's reason the answer ended ("stop": the model ended
         it itself - then a call whose JSON lacks closing brackets is completed)."""
         th, eth, tc = self.ids["[THINK]"], self.ids["[/THINK]"], self.ids["[TOOL_CALLS]"]
@@ -472,7 +473,7 @@ class Chat:
         if tc is not None and tc in rest:
             i = rest.index(tc)
             try:
-                calls = self.decode_calls(rest[i:], finish == "stop")
+                calls = self.decode_calls(rest[i:], finish == "stop", tool_params(tools))
                 rest = rest[:i]
             except Exception as e:   # malformed call: it stays text (and the log says why)
                 raw = self._dec(rest[i:])
@@ -481,7 +482,7 @@ class Chat:
                 calls = []
         return self._dec(rest), self._dec(reasoning), calls
 
-    def decode_calls(self, ids: list[int], may_close: bool) -> list[dict]:
+    def decode_calls(self, ids: list[int], may_close: bool, params: dict | None = None) -> list[dict]:
         """[TOOL_CALLS]name([CALL_ID]id)?[ARGS]{json} ... -> OpenAI tool calls.  Tolerates text after a call's JSON
         (the next call's name when the model left out [TOOL_CALLS]); may_close: the answer's last JSON may lack its
         closing brackets (the model ended the answer itself - never for a cut-off answer)."""
@@ -525,9 +526,9 @@ class Chat:
             name = self._dec(head)
             for k, seg in enumerate(segs[1:], 1):
                 last = last_group and k == len(segs) - 1
-                obj, tail, closed = json_prefix(self._dec(seg), may_close and last)
+                obj, tail, closed = json_prefix(self._dec(seg), may_close and last, (params or {}).get(name.strip()))
                 if closed:
-                    log(f"tool call {name.strip()!r}: closing brackets added (the model ended without them)")
+                    log(f"tool call {name.strip()!r}: repaired (the model ended it with invalid JSON)")
                 add(name, obj, call_id)
                 name, call_id = tail, None   # text after the JSON: the next call's name
             if name.strip():
@@ -546,6 +547,17 @@ def effort_of(body: dict, default: str | None) -> str | None:
     if eff is None:
         return default
     return "none" if str(eff).strip().lower() in ("none", "off", "minimal", "false", "0", "") else "high"
+
+
+def tool_params(tools) -> dict:
+    """{tool name: its parameter names} from a request's tools"""
+    out = {}
+    for t in tools or []:
+        f = t.get("function", t) if isinstance(t, dict) else {}
+        props = ((f.get("parameters") or {}).get("properties") or {}) if isinstance(f, dict) else {}
+        if f.get("name") and props:
+            out[f["name"]] = list(props)
+    return out
 
 
 def request_line(rid: str, st: dict, outcome: str, req: dict | None = None) -> str:
@@ -569,9 +581,58 @@ def request_line(rid: str, st: dict, outcome: str, req: dict | None = None) -> s
     return s + f"; {outcome}"
 
 
-def json_prefix(text: str, may_close: bool):
+def repair_by_keys(s: str, keys: list[str]) -> dict | None:
+    """An arguments object that is no valid JSON because a string value holds unescaped quotes or raw line breaks
+    (code written into an argument: open("x", "r")) -> the object, read along the tool's own parameter names; None if
+    no reading fits.  A value is the text between one '"name":' and the next (or the final '}'); a value in quotes
+    that does not parse is taken as the raw string it was meant to be."""
+    s = s.strip()
+    if not keys or not s.startswith("{") or not s.endswith("}"):
+        return None
+    pat = re.compile(r'[{,]\s*"(' + "|".join(re.escape(k) for k in keys) + r')"\s*:\s*')
+    marks = [m for m in pat.finditer(s)]
+    if not marks or marks[0].start() != 0:
+        return None
+
+    def value(t: str):
+        t = t.strip()
+        try:
+            return json.loads(t)
+        except json.JSONDecodeError:
+            pass
+        if len(t) >= 2 and t[0] == '"' and t[-1] == '"':   # the raw string: escape what the model left bare
+            body = t[1:-1]
+            return json.loads('"' + re.sub(r'(?<!\\)"', r'\\"', body).replace("\n", "\\n").replace("\r", "\\r")
+                              .replace("\t", "\\t") + '"')
+        raise ValueError
+
+    def walk(k: int, seen: frozenset):   # marks[k] starts a key; returns the object from here or None
+        m = marks[k]
+        name = m.group(1)
+        if name in seen:
+            return None
+        for nxt in range(k + 1, len(marks) + 1):   # where this value ends: before a later mark or the final '}'
+            end = marks[nxt].start() if nxt < len(marks) else len(s) - 1
+            try:
+                v = value(s[m.end():end])
+            except (ValueError, json.JSONDecodeError):
+                continue
+            if nxt == len(marks):
+                return {name: v}
+            rest = walk(nxt, seen | {name})
+            if rest is not None:
+                return {name: v, **rest}
+        return None
+    try:
+        return walk(0, frozenset())
+    except RecursionError:
+        return None
+
+
+def json_prefix(text: str, may_close: bool, keys: list[str] | None = None):
     """The JSON value at the start of text -> (value, text after it, closed).  may_close: a value that ends early
-    (closing brackets missing, nothing cut inside a string) is completed."""
+    (closing brackets missing, nothing cut inside a string) is completed, and with the tool's parameter names (keys)
+    unescaped quotes in its strings are escaped."""
     s = text.lstrip()
     try:
         obj, end = json.JSONDecoder().raw_decode(s)
@@ -580,7 +641,11 @@ def json_prefix(text: str, may_close: bool):
         if not may_close:
             raise ValueError(f"invalid JSON ({e.msg} at {e.pos} of {len(s)} characters)") from None
         err = e
-    stack, in_str, esc = [], False, False
+    obj = repair_by_keys(s, keys or [])   # code in an argument with its quotes not escaped (needs the final '}')
+    if obj is not None:
+        log("tool call: unescaped quotes / line breaks inside an argument escaped (the model wrote code into it)")
+        return obj, "", True
+    stack, in_str, esc = [], False, False   # the closing brackets left out
     for ch in s:
         if in_str:
             if esc:
@@ -597,11 +662,13 @@ def json_prefix(text: str, may_close: bool):
             if not stack or stack.pop() != ch:
                 stack = None
                 break
-    if in_str or not stack:
-        raise ValueError(f"invalid JSON ({err.msg} at {err.pos} of {len(s)} characters)")
-    fixed = s.rstrip().rstrip(",") + "".join(reversed(stack))
-    obj, end = json.JSONDecoder().raw_decode(fixed)
-    return obj, "", True
+    if not in_str and stack:
+        try:
+            obj, end = json.JSONDecoder().raw_decode(s.rstrip().rstrip(",") + "".join(reversed(stack)))
+            return obj, "", True
+        except json.JSONDecodeError:
+            pass
+    raise ValueError(f"invalid JSON ({err.msg} at {err.pos} of {len(s)} characters)")
 
 
 # ---------------------------------------------------------------------------------------------- telemetry
@@ -1009,7 +1076,7 @@ def make_handler(S: State):
                     st = run(req, out.extend, lambda: False)
                 except Busy as b:
                     return self._json(b.code, {"error": {"message": b.message, "type": "server_error", "code": "queue_timeout"}})
-                content, reasoning, calls = S.chat.split([t for t in out if t != S.chat.eos], st.get("finish"))
+                content, reasoning, calls = S.chat.split([t for t in out if t != S.chat.eos], st.get("finish"), body.get("tools"))
                 msg = {"role": "assistant", "content": content or (None if calls else "")}
                 if reasoning:
                     msg["reasoning_content"] = reasoning
@@ -1069,7 +1136,7 @@ def make_handler(S: State):
                 except Exception:
                     pass
                 return
-            content, reasoning, calls = S.chat.split([t for t in out if t != S.chat.eos], st.get("finish"))
+            content, reasoning, calls = S.chat.split([t for t in out if t != S.chat.eos], st.get("finish"), body.get("tools"))
             if content.startswith(sent["content"]) and len(content) > len(sent["content"]):
                 chunk({"content": content[len(sent["content"]):]})
             for i, c in enumerate(calls):
