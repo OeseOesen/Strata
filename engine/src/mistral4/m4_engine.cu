@@ -514,6 +514,8 @@ public:
         std::vector<int32_t> stop_ids;
         json embd;            // [{file, rows:[...]}] image rows (prompt positions)
         std::string embd_key; // identity of the images (prefix cache)
+        int32_t tool_start = -1;   // [TOOL_CALLS]: from this token on the answer is sampled at tool_temp
+        float tool_temp = -1.f;    // (< 0: no switch; 0: greedy) - a tool call's JSON wants care, not variety
     };
     struct GenStats {
         int n_prompt = 0, n_reused = 0, n_gen = 0, drafted = 0, accepted = 0, windows = 0, e_drafted = 0,
@@ -545,6 +547,27 @@ private:
     // forward
     void mm(const Mat& m, const float* x, const void* xq, float* y, int T, cudaStream_t s);
     size_t f16_mla(Layer& L);
+public:
+    /// Leaving: the pinned arenas unregistered and the GPU context reset, each step timed into the log (a stop took
+    /// 30+ s after the engine had quit - which step is slow?)
+    void release_timed() {
+        auto t0 = Clock::now();
+        double gib = 0;
+        if (pinned_arenas_)
+            for (const auto& a : arenas_) {
+                cudaHostUnregister(a.first);
+                gib += a.second / GiB;
+            }
+        const double ms_unpin = ms_since(t0);
+        t0 = Clock::now();
+        cudaDeviceReset();
+        const double ms_reset = ms_since(t0);
+        t0 = Clock::now();
+        for (const auto& a : arenas_) m4::node_free(a.first, a.second);
+        logf_("quit: unpinned %.1f GiB in %.1f s, GPU released in %.1f s, arenas freed in %.1f s", gib, ms_unpin / 1000,
+              ms_reset / 1000, ms_since(t0) / 1000);
+    }
+private:
     bool fa_ok(const Layer& L) const {
         return L.wk16 && !dbg_on_ && hp_.nope == 64 && hp_.rope == 64 && hp_.v_dim == 128;
     }
@@ -575,7 +598,11 @@ private:
     void serve_host_layers(int T);
     void prefill(const int32_t* toks, int T, int pos0, const GenParams* gp, int prompt_off, bool all_logits);
     void head(int rows_from, int n_rows);   // logits for rows [rows_from, +n) of x
-    int sample(const float* logits, const GenParams& gp, std::mt19937_64& rng);
+    int sample(const float* logits, const GenParams& gp, std::mt19937_64& rng, float temp = -1.f);
+    /// sample, or inside a tool call (in_tool, tool_temp >= 0) at tool_temp (0: greedy)
+    int pick(const float* logits, const GenParams& gp, bool in_tool, std::mt19937_64& rng) {
+        return sample(logits, gp, rng, in_tool && gp.tool_temp >= 0.f ? gp.tool_temp : gp.temp);
+    }
     void count_heat(int l, const int32_t* ids, int n);
     // EAGLE draft head
     void load_eagle();
@@ -2417,9 +2444,10 @@ void Engine::prefill(const int32_t* toks, int T, int pos0, const GenParams* gp, 
 }
 
 // ------------------------------------------------------------------------------------------------ sampling
-int Engine::sample(const float* lg, const GenParams& gp, std::mt19937_64& rng) {
+int Engine::sample(const float* lg, const GenParams& gp, std::mt19937_64& rng, float temp) {
+    if (temp < 0.f) temp = gp.temp;
     const int n = hp_.n_vocab;
-    if (gp.temp <= 0.f) return (int) (std::max_element(lg, lg + n) - lg);
+    if (temp <= 0.f) return (int) (std::max_element(lg, lg + n) - lg);
     // the best 512 candidates (the mass beyond them is negligible for any sane temperature)
     const int cap = std::min(n, gp.top_k > 0 ? gp.top_k : 512);
     std::vector<int> idx((size_t) n);
@@ -2430,7 +2458,7 @@ int Engine::sample(const float* lg, const GenParams& gp, std::mt19937_64& rng) {
     const double m = lg[idx[0]];
     double sum = 0;
     for (int i = 0; i < cap; ++i) {
-        p[(size_t) i] = std::exp(((double) lg[idx[(size_t) i]] - m) / gp.temp);
+        p[(size_t) i] = std::exp(((double) lg[idx[(size_t) i]] - m) / temp);
         sum += p[(size_t) i];
     }
     int keep = cap;
@@ -2547,6 +2575,7 @@ Engine::GenStats Engine::generate(const std::vector<int32_t>& prompt, const GenP
         if (n + kMaxWin >= opt_.ctx) { st.finish = "context"; return st; }
     }
     std::mt19937_64 rng(gp.seed ? gp.seed : (uint64_t) std::random_device{}());
+    bool in_tool = false;   // the answer has begun a tool call (gp.tool_start)
     // the prefix whose KV is still valid
     int reuse = 0;
     while (reuse < (int) cached_.size() && reuse < n - 1 && cached_[(size_t) reuse] == prompt[(size_t) reuse]) ++reuse;
@@ -2647,7 +2676,8 @@ Engine::GenStats Engine::generate(const std::vector<int32_t>& prompt, const GenP
         } else {
             CK(cudaMemcpy(hlogits_.data(), logits_, (size_t) T * hp_.n_vocab * 4, cudaMemcpyDeviceToHost));
             for (int i = 0; i < T; ++i) {
-                const int y = sample(hlogits_.data() + (size_t) i * hp_.n_vocab, gp, rng);
+                const int y = pick(hlogits_.data() + (size_t) i * hp_.n_vocab, gp, in_tool, rng);
+                if (y == gp.tool_start) in_tool = true;
                 out.push_back(y);
                 if (i + 1 < T && y == win[(size_t) i + 1]) continue;
                 break;
@@ -2793,6 +2823,8 @@ bool parse_gen(const json& req, Engine::GenParams& gp, std::vector<int32_t>& ids
         if (req.contains("stop_ids")) gp.stop_ids = req["stop_ids"].get<std::vector<int32_t>>();
         if (req.contains("embd")) gp.embd = req["embd"];
         gp.embd_key = req.value("embd_key", "");
+        gp.tool_start = req.value("tool_start", -1);
+        gp.tool_temp = req.value("tool_temp", -1.f);
         ids = req.at("ids").get<std::vector<int32_t>>();
     } catch (const std::exception& e) {
         err = e.what();
@@ -2880,7 +2912,7 @@ int Engine::serve_parallel() {
         int slot = -1, state = 0;   // 0 waiting for a slot, 1 reading the prompt, 2 decoding
         int a = 0, n_past = 0, spec = 0, src = 0, ke = 0, row0 = 0, e0 = 0;
         bool use_eagle = false, stop = false, done = false, followed = false, eagle_try = false, chain = false,
-             from_eagle = false;
+             from_eagle = false, in_tool = false;
         double acc_rate = 0.5, cum = 1.0;
         GenStats st;
         std::mt19937_64 rng;
@@ -3156,7 +3188,8 @@ int Engine::serve_parallel() {
             const int n = 1 + (int) r->drafts.size();
             for (int i = 0; i < n; ++i) {
                 const int row = r->row0 + i;
-                const int32_t y = r->gp.temp <= 0.f ? am[row] : sample(hlogits_.data() + (size_t) row * V, r->gp, r->rng);
+                const int32_t y = r->gp.temp <= 0.f ? am[row] : pick(hlogits_.data() + (size_t) row * V, r->gp, r->in_tool, r->rng);
+                if (y == r->gp.tool_start) r->in_tool = true;
                 r->out.push_back(y);
                 if (i + 1 < n && y == r->drafts[(size_t) i]) continue;
                 break;
@@ -3838,6 +3871,8 @@ int run(int argc, char** argv) {
         // the context, the 40 GiB of pinned arenas and the GPU memory when the process ends) - stops took 30+ s
         const int rc = o.parallel > 1 ? eng.serve_parallel() : serve(eng);
         std::fprintf(stderr, "strata-m4: quit\n");
+        std::fflush(nullptr);
+        eng.release_timed();
         std::fflush(nullptr);
         std::_Exit(rc);
     }

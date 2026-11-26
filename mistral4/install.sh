@@ -227,7 +227,7 @@ After=network.target
 [Service]
 User=$USER
 EnvironmentFile=$ENVF
-ExecStart=/bin/bash -c 'exec $PREFIX/venv/bin/python $PREFIX/m4serve.py --engine $PREFIX/bin/strata-m4 --model "\$M4_MODEL" --tokenizer "\$M4_TOKENIZER" \${M4_MMPROJ:+--mmproj "\$M4_MMPROJ" --vision $PREFIX/bin/m4-vision} --engine-args "\$M4_ENGINE_ARGS" --host "\$M4_HOST" --port "\$M4_PORT" \${M4_PARALLEL:+--parallel \$M4_PARALLEL} \${M4_TEMPERATURE:+--temperature \$M4_TEMPERATURE} \${M4_REASONING:+--reasoning-effort \$M4_REASONING}'
+ExecStart=/bin/bash -c 'exec $PREFIX/venv/bin/python $PREFIX/m4serve.py --engine $PREFIX/bin/strata-m4 --model "\$M4_MODEL" --tokenizer "\$M4_TOKENIZER" \${M4_MMPROJ:+--mmproj "\$M4_MMPROJ" --vision $PREFIX/bin/m4-vision} --engine-args "\$M4_ENGINE_ARGS" --host "\$M4_HOST" --port "\$M4_PORT" \${M4_PARALLEL:+--parallel \$M4_PARALLEL} \${M4_TEMPERATURE:+--temperature \$M4_TEMPERATURE} \${M4_REASONING:+--reasoning-effort \$M4_REASONING} \${M4_TOOL_TEMPERATURE:+--tool-temperature \$M4_TOOL_TEMPERATURE}'
 Restart=on-failure
 RestartSec=10
 LimitMEMLOCK=infinity

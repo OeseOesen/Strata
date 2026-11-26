@@ -179,7 +179,7 @@ def wait_ready(env, pid: int, limit: float = 600.0) -> bool:
     return False
 
 
-def stop(grace: float = 30.0) -> bool:
+def stop(grace: float = 120.0) -> bool:
     pids = server_pids()
     if not pids and not engine_pids():
         print("strata-m4: no server is running")
@@ -431,16 +431,16 @@ def main() -> int:
     p = sp.add_parser("launch", help="start the server in the background if needed, then open the monitor")
     p.add_argument("--no-monitor", action="store_true", help="only start the server")
     p.add_argument("--timeout", type=float, default=600.0, help="seconds to wait for the server (default 600)")
-    p.add_argument("--grace", type=float, default=30.0)
+    p.add_argument("--grace", type=float, default=120.0)
     p.add_argument("--parallel", type=int, help="conversations at once for this start (1-8; default M4_PARALLEL, else 1)")
     p = sp.add_parser("serve", help="run the server in the foreground (Ctrl+C stops it)")
     p.add_argument("--parallel", type=int, help="conversations at once (1-8)")
     p.add_argument("rest", nargs=argparse.REMAINDER, help="extra m4serve options")
     p = sp.add_parser("stop", help="stop the server (SIGINT, then forced after --grace seconds)")
-    p.add_argument("--grace", type=float, default=30.0)
+    p.add_argument("--grace", type=float, default=120.0)
     p = sp.add_parser("restart", help="stop, then start in the background")
     p.add_argument("--timeout", type=float, default=600.0)
-    p.add_argument("--grace", type=float, default=30.0)
+    p.add_argument("--grace", type=float, default=120.0)
     p.add_argument("--parallel", type=int, help="conversations at once for this start (1-8)")
     p = sp.add_parser("status", help="state, model, queue, rates, GPU")
     p.add_argument("--json", action="store_true")

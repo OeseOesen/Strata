@@ -480,7 +480,14 @@ class Chat:
                 log(f"tool call not parsed (answer ended by {finish or '?'}, {len(rest) - i} tokens): {e}; "
                     f"start {raw[:120]!r} ... end {raw[-160:]!r}")
                 calls = []
-        return self._dec(rest), self._dec(reasoning), calls
+        content = self._dec(rest)
+        if not calls and finish == "stop" and tools:
+            bare = bare_call(content, tools)
+            if bare:
+                log(f"tool call {bare['function']['name']!r}: the answer was the call's arguments as plain text "
+                    "(no [TOOL_CALLS]); turned into the call")
+                return "", self._dec(reasoning), [bare]
+        return content, self._dec(reasoning), calls
 
     def decode_calls(self, ids: list[int], may_close: bool, params: dict | None = None) -> list[dict]:
         """[TOOL_CALLS]name([CALL_ID]id)?[ARGS]{json} ... -> OpenAI tool calls.  Tolerates text after a call's JSON
@@ -549,6 +556,54 @@ def effort_of(body: dict, default: str | None) -> str | None:
     return "none" if str(eff).strip().lower() in ("none", "off", "minimal", "false", "0", "") else "high"
 
 
+def may_be_bare_call(text: str) -> bool:
+    """While streaming: could this answer still turn out to be a tool call written as plain JSON?"""
+    t = text.lstrip()
+    if t.startswith("{"):
+        return True
+    if t.startswith("```"):
+        first = t.split("\n", 1)[0].strip("`").strip().lower()
+        return first in ("", "json") or ("\n" not in t and "json".startswith(first))
+    return t == "" or "```".startswith(t)
+
+
+def bare_call(text: str, tools) -> dict | None:
+    """An answer that is nothing but one JSON object - a tool call written as plain text, without [TOOL_CALLS] -
+    -> that call, if it fits exactly one of the request's tools: {"name": tool, "arguments": {...}}, or the arguments
+    alone whose names are that tool's (its required ones all there).  Otherwise None (the answer stays text)."""
+    t = text.strip()
+    if t.startswith("```"):   # a fenced block: ```json ... ```
+        t = t.split("\n", 1)[1] if "\n" in t else ""
+        t = t.rsplit("```", 1)[0].strip()
+    if not (t.startswith("{") and t.endswith("}")):
+        return None
+    try:
+        obj = json.loads(t)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(obj, dict) or not obj:
+        return None
+    specs = {}
+    for tl in tools or []:
+        f = tl.get("function", tl) if isinstance(tl, dict) else {}
+        if isinstance(f, dict) and f.get("name"):
+            p = f.get("parameters") or {}
+            specs[f["name"]] = (set((p.get("properties") or {})), set(p.get("required") or []))
+    def call(name, args):
+        return {"id": "call_" + uuid.uuid4().hex[:9], "type": "function",
+                "function": {"name": name, "arguments": json.dumps(args, ensure_ascii=False)}}
+    if set(obj) <= {"name", "arguments", "parameters"} and obj.get("name") in specs:
+        args = obj.get("arguments", obj.get("parameters", {}))
+        if isinstance(args, str):
+            try:
+                args = json.loads(args)
+            except json.JSONDecodeError:
+                return None
+        return call(obj["name"], args) if isinstance(args, dict) else None
+    fits = [n for n, (props, req) in specs.items() if props and set(obj) <= props and req <= set(obj)]
+    return call(fits[0], obj) if len(fits) == 1 else None
+
+
 def tool_params(tools) -> dict:
     """{tool name: its parameter names} from a request's tools"""
     out = {}
@@ -576,8 +631,9 @@ def request_line(rid: str, st: dict, outcome: str, req: dict | None = None) -> s
     if st.get("slot") is not None and int(st.get("slot", -1)) >= 0:
         s += f"; slot {st['slot']}"
     if req:   # how the request asked to be answered
-        s += f"; thinking {req.get('_think') or 'model default'}, temperature {req.get('temp')}, limit {req.get('max_new')}" + \
-             (" (client)" if req.get("_limit_client") else "")
+        s += f"; thinking {req.get('_think') or 'model default'}, temperature {req.get('temp')}" + \
+             (f" (tool calls {req['tool_temp']})" if "tool_temp" in req else "") + \
+             f", limit {req.get('max_new')}" + (" (client)" if req.get("_limit_client") else "")
     return s + f"; {outcome}"
 
 
@@ -1047,11 +1103,19 @@ def make_handler(S: State):
             if temp is None:   # Mistral's advice: 0.7 when the model thinks, low (0.0 .. 0.7 by task) when it does not
                 temp = 0.7 if think == "high" else 0.1
             limit = body.get("max_tokens") or body.get("max_completion_tokens")
-            r = {"ids": ids, "max_new": int(limit or auto), "_think": think, "_limit_client": bool(limit),
+            if body.get("tools") and S.chat.ids.get("[TOOL_CALLS]") is not None and d.get("tool_temperature", -1) >= 0:
+                r_tool = {"tool_start": S.chat.ids["[TOOL_CALLS]"], "tool_temp": float(d["tool_temperature"])}
+            else:
+                r_tool = {}
+            r = {"ids": ids, "max_new": int(limit or auto), "_think": think, "_limit_client": bool(limit), **r_tool,
                  "temp": float(body["temperature"]) if body.get("temperature") is not None else temp,
                  "top_p": float(body.get("top_p", d["top_p"])),
                  "top_k": int(body.get("top_k", 0)), "min_p": float(body.get("min_p", 0.0)),
                  "stop_ids": [S.chat.eos], "seed": int(body.get("seed") or 0)}
+            if "tool_temp" in r:   # never above the request's own
+                r["tool_temp"] = min(r["tool_temp"], r["temp"])
+                if r["tool_temp"] >= r["temp"]:
+                    del r["tool_start"], r["tool_temp"]
             if "spec" in body:
                 r["spec"] = int(body["spec"])
             if embd:
@@ -1119,6 +1183,8 @@ def make_handler(S: State):
                 content, reasoning, _ = S.chat.split(toks)
                 # hold back a trailing replacement char (an unfinished UTF-8 sequence)
                 content, reasoning = content.rstrip("�"), reasoning.rstrip("�")
+                if body.get("tools") and may_be_bare_call(content):   # maybe a call as plain JSON: decided at the end
+                    content = sent["content"]
                 if reasoning.startswith(sent["reasoning"]) and len(reasoning) > len(sent["reasoning"]):
                     chunk({"reasoning_content": reasoning[len(sent["reasoning"]):]})
                     sent["reasoning"] = reasoning
@@ -1202,6 +1268,8 @@ def main():
                     help="answer limit when a request sets none (default 0: the rest of the context, at most 32768)")
     ap.add_argument("--temperature", type=float, default=None,
                     help="for requests that name none (default: 0.7 when the model thinks, else 0.1 - Mistral's advice)")
+    ap.add_argument("--tool-temperature", type=float, default=0.1,
+                    help="temperature inside a tool call, from [TOOL_CALLS] on (default 0.1; -1: the request's own)")
     ap.add_argument("--reasoning-effort", choices=("none", "high"), default=None,
                     help="thinking for requests that name none (default: the model's own default)")
     ap.add_argument("--top-p", type=float, default=1.0)
@@ -1223,7 +1291,8 @@ def main():
     S.tele.context = S.engine.info.get("ctx")
     S.tele.slots_n = S.engine.parallel
     S.tele.max_queue, S.tele.queue_timeout = max(0, a.max_queue), max(1.0, a.queue_timeout)
-    S.defaults = {"max_tokens": a.max_tokens, "temperature": a.temperature, "top_p": a.top_p}
+    S.defaults = {"max_tokens": a.max_tokens, "temperature": a.temperature, "top_p": a.top_p,
+                  "tool_temperature": a.tool_temperature}
     srv = ThreadingHTTPServer((a.host, a.port), make_handler(S))
 
     def _stop(signum, frame):   # SIGINT and SIGTERM both end the server cleanly (a shell's background job ignores
@@ -1241,7 +1310,7 @@ def main():
         try:
             S.engine.p.stdin.write("QUIT\n")
             S.engine.p.stdin.flush()
-            S.engine.p.wait(timeout=30)
+            S.engine.p.wait(timeout=120)   # the engine logs its own release steps; let it finish
             log(f"engine ended in {time.time() - t0:.1f} s")
         except Exception:
             S.engine.p.kill()
