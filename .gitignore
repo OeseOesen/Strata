@@ -124,3 +124,14 @@ node_modules/
 /build-vision-spark/
 /terminal/.venv-build/
 /.venv-build/
+
+# strata-m4 fork: agent workshop scripts (Auftrags-Builds, Messlaeufe) stay out of git
+/auftrag*.sh
+/build-erg*.sh
+/banken*.sh
+/deploy*.sh
+/longctx*.sh
+/erg*zusatz*.txt
+/Mistral-Probleme.txt
+/strata-mistral4-deploy.txt
+/strata-m4-*.tar.gz
