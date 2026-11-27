@@ -1310,6 +1310,7 @@ def main():
         try:
             S.engine.p.stdin.write("QUIT\n")
             S.engine.p.stdin.flush()
+            S.engine.p.stdin.close()   # end of input as well: the engine's line reader lets go of stdin
             S.engine.p.wait(timeout=120)   # the engine logs its own release steps; let it finish
             log(f"engine ended in {time.time() - t0:.1f} s")
         except Exception:

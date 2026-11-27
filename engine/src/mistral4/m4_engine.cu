@@ -3932,7 +3932,10 @@ int run(int argc, char** argv) {
         // the context, the 40 GiB of pinned arenas and the GPU memory when the process ends) - stops took 30+ s
         const int rc = o.parallel > 1 ? eng.serve_parallel() : serve(eng);
         std::fprintf(stderr, "strata-m4: quit\n");
-        std::fflush(nullptr);
+        // stdout and stderr only: fflush(nullptr) - like exit() - also takes the lock of stdin, which the line reader
+        // holds while it waits in getline for m4serve's next line; m4serve waits for us: stops hung until the kill
+        std::fflush(stdout);
+        std::fflush(stderr);
         std::_Exit(rc);
     }
     if (o.mode == "eagle-acc") {
