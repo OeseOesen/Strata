@@ -124,7 +124,8 @@ struct Options {
     // 256 rows that each conversation takes as it grows (--ctx is the pool, not a per-slot limit)
     int parallel = 1, pf_interleave = 1024;
     bool pf_gemm = true, chunk_set = false;
-    bool pf_fa = false;   // prompt attention per head in one fused kernel (--pf-attn fa) instead of the absorbed GEMMs
+    bool pf_fa = false;
+    double pin_gib = 20;  // --selftest-pin: GiB per node   // prompt attention per head in one fused kernel (--pf-attn fa) instead of the absorbed GEMMs
     double vram_reserve = 1.5, vram_experts = -1, ram_gpu_node = -1, ram_other_node = -1;
     std::string eagle;            // EAGLE draft head: Mistral's consolidated.safetensors (or its folder)
     int eagle_k = 3;              // drafts per window at most (Mistral recommends 3)
@@ -180,6 +181,8 @@ void usage() {
                  "  --attn-temp-scale X      override the GGUF's llama-4 attention temperature (beta; 0.1 from 8192 on is what\n"
                  "                           Mistral's own params.json says; the unsloth GGUF carries none)\n"
                  "  --selftest-attn          check the attention kernels against a CPU reference on random data (no model)\n"
+                 "  --selftest-pin [GiB]     time pinning / unpinning host arenas like the server's (default 20 GiB per\n"
+                 "                           node; no model): which step of a stop is slow\n"
                  "  --gpu N                  CUDA device (default 0)\n");
 }
 
@@ -236,6 +239,10 @@ Options parse(int argc, char** argv) {
         }
         else if (a == "--attn-temp-scale") o.attn_temp_scale = std::stod(next());
         else if (a == "--selftest-attn") o.mode = "selftest-attn";
+        else if (a == "--selftest-pin") {
+            o.mode = "selftest-pin";
+            if (i + 1 < argc && argv[i + 1][0] != '-') o.pin_gib = std::stod(argv[++i]);
+        }
         else if (a == "--bench-pp") o.bench_pp = std::stoi(next());
         else if (a == "--bench-tg") o.bench_tg = std::stoi(next());
         else if (a == "--seed") o.seed = std::stoi(next());
@@ -243,7 +250,7 @@ Options parse(int argc, char** argv) {
         else if (a == "-h" || a == "--help") { usage(); std::exit(0); }
         else fail("unknown option " + a + " (--help)");
     }
-    if (o.model.empty() && o.mode != "selftest-attn") { usage(); fail("no model (-m)"); }
+    if (o.model.empty() && o.mode != "selftest-attn" && o.mode != "selftest-pin") { usage(); fail("no model (-m)"); }
     if (o.attn_gemm) o.graph = false;   // the cuBLAS route's sizes follow the context: not capturable
     o.spec = std::max(0, std::min(o.spec, kMaxWin - 1));
     o.eagle_k = std::max(1, std::min(o.eagle_k, kMaxWin - 1));
@@ -547,27 +554,6 @@ private:
     // forward
     void mm(const Mat& m, const float* x, const void* xq, float* y, int T, cudaStream_t s);
     size_t f16_mla(Layer& L);
-public:
-    /// Leaving: the pinned arenas unregistered and the GPU context reset, each step timed into the log (a stop took
-    /// 30+ s after the engine had quit - which step is slow?)
-    void release_timed() {
-        auto t0 = Clock::now();
-        double gib = 0;
-        if (pinned_arenas_)
-            for (const auto& a : arenas_) {
-                cudaHostUnregister(a.first);
-                gib += a.second / GiB;
-            }
-        const double ms_unpin = ms_since(t0);
-        t0 = Clock::now();
-        cudaDeviceReset();
-        const double ms_reset = ms_since(t0);
-        t0 = Clock::now();
-        for (const auto& a : arenas_) m4::node_free(a.first, a.second);
-        logf_("quit: unpinned %.1f GiB in %.1f s, GPU released in %.1f s, arenas freed in %.1f s", gib, ms_unpin / 1000,
-              ms_reset / 1000, ms_since(t0) / 1000);
-    }
-private:
     bool fa_ok(const Layer& L) const {
         return L.wk16 && !dbg_on_ && hp_.nope == 64 && hp_.rope == 64 && hp_.v_dim == 128;
     }
@@ -3674,6 +3660,80 @@ int selftest_fa(cudaStream_t s, cublasHandle_t cb) {
     return fails;
 }
 
+// --selftest-pin: the server's host arenas (one per node, huge pages, first touch on the node) pinned for DMA and
+// released again, every step timed and printed the moment it starts and ends - a stop of the server hung 30-120 s
+// after "quit"; this finds the step without a model and without stopping the server.
+static double anon_huge_gib() {
+    std::ifstream f("/proc/self/smaps_rollup");
+    std::string k;
+    double kb = 0;
+    while (f >> k) {
+        if (k == "AnonHugePages:") { f >> kb; break; }
+        std::string rest;
+        std::getline(f, rest);
+    }
+    return kb / (1024.0 * 1024.0);
+}
+
+int selftest_pin(int gpu, double gib_per_node) {
+    auto step = [](const char* what) {
+        std::printf("pin: %-58s ...", what);
+        std::fflush(stdout);
+        return Clock::now();
+    };
+    auto done = [](Clock::time_point t0, const char* extra = "") {
+        std::printf(" %.2f s%s\n", ms_since(t0) / 1000.0, extra);
+        std::fflush(stdout);
+    };
+    m4::Topology topo = m4::Topology::detect();
+    const size_t bytes = (size_t) (gib_per_node * GiB);
+    std::printf("pin: %zu node(s), %.1f GiB per node\n", topo.nodes.size(), gib_per_node);
+    auto t = step("CUDA context");
+    CK(cudaSetDevice(gpu));
+    CK(cudaFree(nullptr));
+    done(t);
+    std::vector<std::pair<void*, size_t>> ar;
+    for (size_t n = 0; n < std::max<size_t>(1, topo.nodes.size()); ++n) {
+        char what[96];
+        std::snprintf(what, sizeof what, "arena on node %zu: allocate + first touch", n);
+        t = step(what);
+        std::string err;
+        void* p = m4::node_alloc(bytes, topo.nodes.empty() ? -1 : topo.nodes[n].id, topo, err);
+        if (!p) fail("node_alloc: " + err);
+        ar.push_back({p, bytes});
+        done(t);
+    }
+    std::printf("pin: huge pages in the arenas: %.1f of %.1f GiB\n", anon_huge_gib(), ar.size() * gib_per_node);
+    std::fflush(stdout);
+    for (int round = 0; round < 2; ++round) {   // whole arenas as the server does; then in 1 GiB pieces
+        const size_t piece = round == 0 ? 0 : (size_t) GiB;
+        char what[96];
+        std::snprintf(what, sizeof what, "cudaHostRegister (%s)", round == 0 ? "whole arenas" : "1 GiB pieces");
+        t = step(what);
+        for (auto& a : ar)
+            for (size_t o = 0; o < a.second; o += piece ? piece : a.second)
+                CK(cudaHostRegister((char*) a.first + o, std::min(piece ? piece : a.second, a.second - o),
+                                    cudaHostRegisterPortable));
+        done(t);
+        std::snprintf(what, sizeof what, "cudaHostUnregister (%s)", round == 0 ? "whole arenas" : "1 GiB pieces");
+        t = step(what);
+        for (auto& a : ar)
+            for (size_t o = 0; o < a.second; o += piece ? piece : a.second) CK(cudaHostUnregister((char*) a.first + o));
+        done(t);
+    }
+    t = step("cudaHostRegister again (whole arenas)");
+    for (auto& a : ar) CK(cudaHostRegister(a.first, a.second, cudaHostRegisterPortable));
+    done(t);
+    t = step("cudaDeviceReset with the arenas still pinned");
+    cudaDeviceReset();
+    done(t);
+    t = step("free the arenas");
+    for (auto& a : ar) m4::node_free(a.first, a.second);
+    done(t);
+    std::printf("selftest-pin: done\n");
+    return 0;
+}
+
 int selftest_attn(int gpu) {
     CK(cudaSetDevice(gpu));
     cudaStream_t s;
@@ -3864,6 +3924,7 @@ int selftest_attn(int gpu) {
 int run(int argc, char** argv) {
     const Options o = parse(argc, argv);
     if (o.mode == "selftest-attn") return selftest_attn(o.gpu);
+    if (o.mode == "selftest-pin") return selftest_pin(o.gpu, o.pin_gib);
     Engine eng(o);
     eng.load();
     if (o.mode == "serve") {
@@ -3871,8 +3932,6 @@ int run(int argc, char** argv) {
         // the context, the 40 GiB of pinned arenas and the GPU memory when the process ends) - stops took 30+ s
         const int rc = o.parallel > 1 ? eng.serve_parallel() : serve(eng);
         std::fprintf(stderr, "strata-m4: quit\n");
-        std::fflush(nullptr);
-        eng.release_timed();
         std::fflush(nullptr);
         std::_Exit(rc);
     }
